@@ -508,3 +508,66 @@ async def test_read_page_follows_real_galiciana_export_mets_link() -> None:
     )
     assert result['mets_resumen']['solicitudes_exportacion'] == 2
     assert 'Manuel Pérez Eiriz' in result['texto_ocr']
+
+
+@pytest.mark.asyncio
+async def test_investigate_can_enrich_result_with_full_alto_context() -> None:
+    viewer_html = '''<!doctype html><html><body>
+      <a href="/es/media/group/export-mets.do?path=1356353">Exportar METS</a>
+      <img src="/es/media/object-miniature.do?id=13274184">
+    </body></html>'''
+    mets = '''<?xml version="1.0" encoding="UTF-8"?>
+    <mets:mets xmlns:mets="http://www.loc.gov/METS/" xmlns:xlink="http://www.w3.org/1999/xlink">
+      <mets:fileSec>
+        <mets:fileGrp USE="images"><mets:file ID="IMG13274184" MIMETYPE="image/jpeg"><mets:FLocat xlink:href="/files/page.jpg"/></mets:file></mets:fileGrp>
+        <mets:fileGrp USE="ocr"><mets:file ID="OCR13274184" MIMETYPE="text/xml"><mets:FLocat xlink:href="/files/page.xml"/></mets:file></mets:fileGrp>
+      </mets:fileSec>
+      <mets:structMap><mets:div TYPE="book"><mets:div TYPE="page"><mets:fptr FILEID="IMG13274184"/><mets:fptr FILEID="OCR13274184"/></mets:div></mets:div></mets:structMap>
+    </mets:mets>'''
+    alto = '''<?xml version="1.0" encoding="UTF-8"?>
+    <alto xmlns="http://www.loc.gov/standards/alto/ns-v4#"><Layout><Page><PrintSpace><TextBlock>
+      <TextLine><String CONTENT="JUZGADOS"/></TextLine>
+      <TextLine><String CONTENT="Don"/><String CONTENT="Manuel"/><String CONTENT="Pérez"/><String CONTENT="Eiriz,"/></TextLine>
+      <TextLine><String CONTENT="Capitán"/><String CONTENT="graduado"/><String CONTENT="Teniente"/><String CONTENT="Ayudante"/><String CONTENT="y"/><String CONTENT="fiscal"/></TextLine>
+      <TextLine><String CONTENT="del"/><String CONTENT="Batallón"/><String CONTENT="Depósito"/><String CONTENT="de"/><String CONTENT="Lugo."/></TextLine>
+    </TextBlock></PrintSpace></Page></Layout></alto>'''
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith('/es/inicio/inicio.do') or path.endswith('/es/consulta/busqueda.do'):
+            return httpx.Response(200, text='<html></html>')
+        if path.endswith('/es/consulta/resultados_ocr.do'):
+            return httpx.Response(200, text=FIXTURE_HTML)
+        if path.endswith('/es/catalogo_imagenes/grupo.do'):
+            return httpx.Response(200, text=viewer_html)
+        if path.endswith('/es/media/group/export-mets.do'):
+            return httpx.Response(200, text=mets, headers={'content-type': 'application/xml'})
+        if path.endswith('/files/page.xml'):
+            return httpx.Response(200, text=alto, headers={'content-type': 'application/xml'})
+        raise AssertionError(f'Unexpected URL: {request.url}')
+
+    connector = GalicianaOCRConnector(transport=httpx.MockTransport(handler))
+    report = await connector.investigate(
+        GenealogyQuery(
+            name='Manuel Pérez Eiriz',
+            places=['Lugo'],
+            year_from=1870,
+            year_to=1910,
+        ),
+        maximum_queries=1,
+        maximum_results=20,
+        read_full_pages=True,
+        maximum_full_pages=1,
+        full_page_concurrency=1,
+    )
+
+    assert report.full_pages_requested == 1
+    assert report.full_pages_read == 1
+    assert report.full_pages_failed == 0
+    first = next(item for item in report.mentions if item.image_id == '13274184')
+    assert first.full_text_status == 'ok'
+    assert first.expanded_contexts
+    assert 'Capitán graduado Teniente Ayudante' in first.expanded_contexts[0]
+    assert first.ocr_url and first.ocr_url.endswith('/files/page.xml')
+    assert 'militar' in {item.category for item in first.interpretations}
+    assert report.chronology[0]['evidence_source'] == 'ALTO XML completo'

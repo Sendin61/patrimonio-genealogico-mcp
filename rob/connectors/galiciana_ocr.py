@@ -180,6 +180,12 @@ class GalicianaOCRMention:
     score: float
     score_reasons: list[str]
     interpretations: list[OCRInterpretation]
+    full_text_status: str = "not_requested"
+    expanded_contexts: list[str] = field(default_factory=list)
+    full_text_length: int = 0
+    ocr_url: str | None = None
+    image_url: str | None = None
+    full_text_error: str | None = None
 
 
 @dataclass(slots=True)
@@ -206,6 +212,9 @@ class GalicianaOCRReport:
     chronology: list[dict[str, Any]]
     total_unique: int
     note: str
+    full_pages_requested: int = 0
+    full_pages_read: int = 0
+    full_pages_failed: int = 0
 
 
 @dataclass(slots=True)
@@ -412,6 +421,85 @@ def _score_mention(
             reasons.append("fecha compatible")
 
     return round(max(0.0, min(score, 1.0)), 3), reasons
+
+
+def _extract_expanded_contexts(
+    full_text: str,
+    query: GenealogyQuery,
+    *,
+    context_lines: int = 8,
+    maximum: int = 4,
+) -> list[str]:
+    """Extract substantial evidence windows around the person from a full OCR page.
+
+    ALTO text keeps newspaper line breaks, so the name may span two or three
+    lines. Search rolling line windows for the canonical name and supplied
+    variants, then return enough surrounding text for a language model or
+    researcher to understand the event without reading the whole page.
+    """
+    raw_lines = [_compact(line) for line in full_text.splitlines() if _compact(line)]
+    if not raw_lines:
+        compacted = _compact(full_text)
+        return [compacted[:4000]] if compacted else []
+
+    names = [query.name, *query.variants]
+    normalized_names = [_normalise(value) for value in names if _compact(value)]
+    canonical_tokens = [
+        token
+        for token in re.findall(r"[a-z0-9]+", _normalise(query.name))
+        if len(token) >= 2
+    ]
+    surname_tokens = canonical_tokens[1:] if len(canonical_tokens) >= 2 else canonical_tokens
+
+    hits: list[int] = []
+    for index in range(len(raw_lines)):
+        nearby = " ".join(raw_lines[max(0, index - 2) : min(len(raw_lines), index + 3)])
+        normalized_nearby = _normalise(nearby)
+        exact = any(name and name in normalized_nearby for name in normalized_names)
+        token_match = bool(canonical_tokens) and all(
+            token in normalized_nearby for token in canonical_tokens
+        )
+        relaxed = (
+            bool(surname_tokens)
+            and all(token in normalized_nearby for token in surname_tokens)
+            and canonical_tokens[0] in normalized_nearby
+        )
+        if exact or token_match or relaxed:
+            hits.append(index)
+
+    # OCR can corrupt one component of the name. Fall back to a window that
+    # contains the rarest surname plus at least one other name component.
+    if not hits and canonical_tokens:
+        rarest = max(canonical_tokens, key=len)
+        for index, line in enumerate(raw_lines):
+            normalized_line = _normalise(
+                " ".join(raw_lines[max(0, index - 2) : min(len(raw_lines), index + 3)])
+            )
+            matched = sum(token in normalized_line for token in canonical_tokens)
+            if rarest in normalized_line and matched >= min(2, len(canonical_tokens)):
+                hits.append(index)
+
+    contexts: list[str] = []
+    seen: set[str] = set()
+    for index in hits:
+        start = max(0, index - context_lines)
+        end = min(len(raw_lines), index + context_lines + 1)
+        context = "\n".join(raw_lines[start:end]).strip()
+        normalized = _normalise(context)
+        if not context or normalized in seen:
+            continue
+        if any(normalized in _normalise(existing) or _normalise(existing) in normalized for existing in contexts):
+            continue
+        seen.add(normalized)
+        contexts.append(context)
+        if len(contexts) >= maximum:
+            break
+
+    return contexts
+
+
+def _best_evidence(mention: GalicianaOCRMention) -> list[str]:
+    return mention.expanded_contexts or mention.snippets
 
 
 def _safe_url(url: str) -> str:
@@ -1280,7 +1368,8 @@ def _aggregate_findings(
                     "date": item.date,
                     "title": item.title,
                     "page": item.page,
-                    "evidence": item.snippets[0] if item.snippets else "",
+                    "evidence": _best_evidence(item)[0] if _best_evidence(item) else "",
+                    "full_text_status": item.full_text_status,
                     "url": item.page_url,
                 }
             )
@@ -1311,9 +1400,15 @@ def _build_chronology(
             "title": mention.title,
             "publication": mention.parent_publication,
             "page": mention.page,
-            "evidence": mention.snippets,
+            "evidence": _best_evidence(mention),
+            "evidence_source": (
+                "ALTO XML completo" if mention.expanded_contexts else "fragmento de resultados OCR"
+            ),
             "interpretations": [item.category for item in mention.interpretations],
             "score": mention.score,
+            "full_text_status": mention.full_text_status,
+            "ocr_url": mention.ocr_url,
+            "image_url": mention.image_url,
             "url": mention.page_url,
         }
         for mention in sorted(
@@ -1437,6 +1532,63 @@ class GalicianaOCRConnector:
             diagnostic.error = str(last_exc).strip() or repr(last_exc)
         return [], diagnostic
 
+    async def _enrich_mentions_with_full_text(
+        self,
+        mentions: list[GalicianaOCRMention],
+        query: GenealogyQuery,
+        *,
+        maximum_pages: int,
+        concurrency: int,
+    ) -> tuple[int, int, int]:
+        """Read ALTO OCR for selected result pages and attach expanded evidence."""
+        selected = mentions[: max(0, maximum_pages)]
+        if not selected:
+            return 0, 0, 0
+
+        semaphore = asyncio.Semaphore(max(1, min(concurrency, 4)))
+
+        async def enrich(mention: GalicianaOCRMention) -> None:
+            mention.full_text_status = "pending"
+            try:
+                async with semaphore:
+                    result = await self.read_page(mention.page_url)
+                full_text = str(result.get("texto_ocr") or "")
+                complete = bool(result.get("lectura_completa") and full_text.strip())
+                mention.ocr_url = result.get("ocr_url")
+                mention.image_url = result.get("imagen_pagina")
+                mention.full_text_length = len(full_text)
+
+                if not complete:
+                    mention.full_text_status = str(result.get("estado") or "partial")
+                    errors = result.get("errores_recuperacion") or []
+                    mention.full_text_error = "; ".join(str(item) for item in errors[-3:]) or (
+                        str(result.get("error") or "No se obtuvo ALTO XML para la página.")
+                    )
+                    return
+
+                contexts = _extract_expanded_contexts(full_text, query)
+                mention.expanded_contexts = contexts
+                mention.full_text_status = "ok"
+                mention.full_text_error = None
+
+                evidence = contexts or mention.snippets
+                score, reasons = _score_mention(
+                    " ".join(evidence),
+                    mention.date,
+                    query,
+                )
+                mention.score = score
+                mention.score_reasons = reasons
+                mention.interpretations = interpret_snippets(evidence)
+            except Exception as exc:  # remote failures must not erase search results
+                mention.full_text_status = "error"
+                mention.full_text_error = f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"
+
+        await asyncio.gather(*(enrich(mention) for mention in selected))
+        read = sum(mention.full_text_status == "ok" for mention in selected)
+        failed = len(selected) - read
+        return len(selected), read, failed
+
     async def investigate(
         self,
         query: GenealogyQuery,
@@ -1444,6 +1596,9 @@ class GalicianaOCRConnector:
         maximum_queries: int = 6,
         maximum_results: int = 120,
         maximum_pages_per_query: int = 5,
+        read_full_pages: bool = False,
+        maximum_full_pages: int = 40,
+        full_page_concurrency: int = 2,
     ) -> GalicianaOCRReport:
         planned_queries = build_ocr_queries(query, maximum=maximum_queries)
         executed_queries: list[str] = []
@@ -1492,6 +1647,25 @@ class GalicianaOCRConnector:
             unique.values(),
             key=lambda item: (-item.score, item.date or "9999", item.title),
         )
+
+        full_pages_requested = 0
+        full_pages_read = 0
+        full_pages_failed = 0
+        if read_full_pages and mentions:
+            (
+                full_pages_requested,
+                full_pages_read,
+                full_pages_failed,
+            ) = await self._enrich_mentions_with_full_text(
+                mentions,
+                query,
+                maximum_pages=max(0, min(maximum_full_pages, len(mentions))),
+                concurrency=full_page_concurrency,
+            )
+            mentions.sort(
+                key=lambda item: (-item.score, item.date or "9999", item.title)
+            )
+
         successful = sum(1 for item in diagnostics if item.ok)
         if successful == len(diagnostics) and successful:
             status = "ok"
@@ -1499,6 +1673,8 @@ class GalicianaOCRConnector:
             status = "partial"
         else:
             status = "unavailable"
+        if read_full_pages and full_pages_failed and status == "ok":
+            status = "partial"
 
         return GalicianaOCRReport(
             status=status,
@@ -1512,9 +1688,13 @@ class GalicianaOCRConnector:
                 "Cada página física se devuelve una sola vez aunque aparezca en "
                 "varias consultas. El intervalo cronológico se aplica como filtro "
                 "real. Las búsquedas amplias solo se ejecutan cuando las frases "
-                "exactas no producen suficientes resultados. Los hechos proceden "
-                "exclusivamente del OCR y de los documentos de Galiciana."
+                "exactas no producen suficientes resultados. Cuando se solicita "
+                "lectura profunda, las evidencias ampliadas proceden del ALTO XML "
+                "asociado a cada página; los datos previos solo desambiguan."
             ),
+            full_pages_requested=full_pages_requested,
+            full_pages_read=full_pages_read,
+            full_pages_failed=full_pages_failed,
         )
 
     async def read_page(self, page_url: str) -> dict[str, Any]:

@@ -64,7 +64,7 @@ def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     return {
         "servidor": "Rob — Metabuscador Genealógico",
-        "version": "0.5.5",
+        "version": "0.6.0",
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "nota": "development no significa verificado; la prueba real se hace contra cada portal.",
@@ -115,12 +115,16 @@ async def investigar_persona_galiciana(
     profesion: str = "",
     max_consultas: int = 6,
     max_resultados: int = 120,
+    leer_paginas_completas: bool = True,
+    max_paginas_completas: int = 40,
+    concurrencia_lectura: int = 2,
 ) -> dict[str, Any]:
     """
     Investiga una persona dentro del OCR real de Galiciana.
 
     Genera variantes, recoge las páginas coincidentes, elimina duplicados,
-    puntúa posibles homónimos y organiza una cronología y hallazgos temáticos.
+    lee automáticamente el ALTO XML de las páginas seleccionadas, puntúa
+    posibles homónimos y organiza una cronología y hallazgos temáticos.
     Los datos previos se usan únicamente para desambiguar: los hechos devueltos
     deben proceder de los fragmentos y documentos de Galiciana.
     """
@@ -138,19 +142,42 @@ async def investigar_persona_galiciana(
         query,
         maximum_queries=max(1, min(max_consultas, 10)),
         maximum_results=max(1, min(max_resultados, 300)),
+        read_full_pages=leer_paginas_completas,
+        maximum_full_pages=max(0, min(max_paginas_completas, 100)),
+        full_page_concurrency=max(1, min(concurrencia_lectura, 4)),
     )
     return {
         "fuente": "Galiciana — búsqueda OCR a texto completo",
         "capacidad": (
-            "búsqueda dentro de páginas digitalizadas, extracción de fragmentos, "
-            "cronología e interpretación genealógica inicial"
+            "búsqueda dentro de páginas digitalizadas, lectura automática del OCR "
+            "completo mediante METS/ALTO, evidencias ampliadas, cronología y "
+            "desambiguación genealógica"
         ),
         "estado": report.status,
         "consultas_realizadas": report.queries,
         "diagnostico": [asdict(item) for item in report.diagnostics],
         "total_menciones_unicas": report.total_unique,
+        "paginas_completas_solicitadas": report.full_pages_requested,
+        "paginas_completas_leidas": report.full_pages_read,
+        "paginas_completas_fallidas": report.full_pages_failed,
         "hallazgos": report.findings,
         "cronologia": report.chronology,
+        "evidencias_documentales": [
+            {
+                "fecha": item.date,
+                "titulo": item.title,
+                "publicacion": item.parent_publication,
+                "pagina": item.page,
+                "contextos": item.expanded_contexts,
+                "categorias": [value.category for value in item.interpretations],
+                "puntuacion": item.score,
+                "url_pagina": item.page_url,
+                "url_ocr": item.ocr_url,
+                "url_imagen": item.image_url,
+            }
+            for item in report.mentions
+            if item.expanded_contexts
+        ],
         "menciones": [asdict(item) for item in report.mentions],
         "nota_metodologica": report.note,
     }
