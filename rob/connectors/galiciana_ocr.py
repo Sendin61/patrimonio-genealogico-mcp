@@ -447,10 +447,180 @@ def _safe_discovered_url(url: str, *, base_url: str) -> str | None:
     return absolute
 
 
+def _clean_xml_payload(xml_text: str, *, root_name: str | None = None) -> str:
+    """Repair common DIGIBIB export defects before strict XML parsing.
+
+    Galiciana occasionally returns METS/ALTO with a UTF-8 BOM, HTML wrappers,
+    illegal control characters or bare ampersands inside generated URLs. The
+    repository still exposes usable XML, so normalise only those transport
+    defects without altering document text.
+    """
+    text = xml_text.lstrip("\ufeff\x00 \t\r\n")
+
+    # Some download endpoints wrap the XML in PRE/TEXTAREA inside an HTML page.
+    if "<html" in text[:500].casefold():
+        soup = BeautifulSoup(text, "html.parser")
+        wrapped = soup.find(["pre", "textarea"])
+        if wrapped is not None:
+            candidate = html_lib.unescape(wrapped.get_text("", strip=False)).strip()
+            if candidate.startswith("<?xml") or "<mets" in candidate.casefold() or "<alto" in candidate.casefold():
+                text = candidate
+
+    if root_name:
+        # Drop headers/wrappers before the actual XML root and trailing HTML.
+        start_match = re.search(
+            rf"<(?:[A-Za-z_][\w.-]*:)?{re.escape(root_name)}\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        end_matches = list(
+            re.finditer(
+                rf"</(?:[A-Za-z_][\w.-]*:)?{re.escape(root_name)}\s*>",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
+        if start_match and end_matches:
+            text = text[start_match.start() : end_matches[-1].end()]
+
+    # XML 1.0 permits TAB, LF, CR and characters from U+0020 upwards.
+    text = "".join(
+        char
+        for char in text
+        if char in "\t\n\r" or ord(char) >= 0x20
+    )
+
+    # DIGIBIB exports sometimes leave query-string ampersands unescaped inside
+    # xlink:href attributes. Preserve valid entities and escape only bare ones.
+    text = re.sub(
+        r"&(?!#\d+;|#x[0-9A-Fa-f]+;|[A-Za-z_:][A-Za-z0-9_.:-]*;)",
+        "&amp;",
+        text,
+    )
+    return text.strip()
+
+
+def _looks_like_mets_url(url: str) -> bool:
+    """Accept concrete METS download resources, not JS variable names or HTML."""
+    if not url or any(char in url for char in "<>\n\r\t"):
+        return False
+    parsed = urlparse(url)
+    path = parsed.path.casefold()
+    return (
+        path.endswith(".xml")
+        or path.endswith("/mets.do")
+        or "/media/group/mets.do" in path
+        or "descargar_mets.do" in path
+    )
+
+
+def _contains_mets_xml(text: str) -> bool:
+    return bool(
+        re.search(
+            r"<(?:[A-Za-z_][\w.-]*:)?mets\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _form_requests_from_html(html: str, *, base_url: str) -> list[dict[str, Any]]:
+    """Build browser-like submissions from a METS export intermediary page."""
+    soup = BeautifulSoup(html, "html.parser")
+    output: list[dict[str, Any]] = []
+
+    for form in soup.select("form"):
+        action = _safe_discovered_url(
+            form.get("action", "") or base_url,
+            base_url=base_url,
+        )
+        if not action:
+            continue
+
+        label = _normalise(
+            " ".join(
+                [
+                    form.get("id", ""),
+                    form.get("name", ""),
+                    form.get_text(" ", strip=True),
+                    action,
+                ]
+            )
+        )
+        # The export page may use a generic form action, but its visible text
+        # still identifies it as the METS workflow.
+        if "mets" not in label and "export" not in label and "descargar" not in label:
+            continue
+
+        data: dict[str, str] = {}
+        submit_added = False
+        for field in form.select("input, select, textarea, button"):
+            if field.has_attr("disabled"):
+                continue
+            name = str(field.get("name", "")).strip()
+            if not name:
+                continue
+
+            tag = field.name.casefold()
+            field_type = str(field.get("type", "")).casefold()
+            if tag == "input" and field_type in {"checkbox", "radio"} and not field.has_attr("checked"):
+                continue
+            if tag in {"button"} or (tag == "input" and field_type in {"submit", "button", "image"}):
+                if submit_added:
+                    continue
+                submit_added = True
+
+            if tag == "select":
+                option = field.select_one("option[selected]") or field.select_one("option")
+                value = str(option.get("value", "")) if option else ""
+            elif tag == "textarea":
+                value = field.get_text("", strip=False)
+            else:
+                value = str(field.get("value", ""))
+            data[name] = value
+
+        method = str(form.get("method", "get")).upper()
+        if method not in {"GET", "POST"}:
+            method = "GET"
+        output.append({"method": method, "url": action, "data": data})
+
+    return output
+
+
+def _discover_mets_urls_from_html(html: str, *, base_url: str) -> list[str]:
+    """Find only concrete downloadable METS/XML resources in HTML."""
+    soup = BeautifulSoup(html, "html.parser")
+    output: list[str] = []
+
+    def add(candidate: str) -> None:
+        absolute = _safe_discovered_url(candidate, base_url=base_url)
+        if absolute and _looks_like_mets_url(absolute) and absolute not in output:
+            output.append(absolute)
+
+    for anchor in soup.select("a[href]"):
+        label = _normalise(anchor.get_text(" ", strip=True))
+        href = str(anchor.get("href", ""))
+        if "mets" in label or "export" in label or _looks_like_mets_url(urljoin(base_url, href)):
+            add(href)
+
+    for element in soup.find_all(True):
+        for attr_value in element.attrs.values():
+            values = attr_value if isinstance(attr_value, list) else [attr_value]
+            for value in values:
+                if isinstance(value, str) and "mets" in value.casefold():
+                    add(value)
+
+    # Script strings are accepted only when they are compact URL-like values.
+    for match in re.finditer(r"[\"']([^\"'<>\s]{1,500}mets[^\"'<>\s]{0,500})[\"']", html, re.I):
+        add(match.group(1))
+
+    return output
+
+
 def _extract_alto_text(xml_text: str) -> str:
     """Extract reading-order text from an ALTO XML page."""
     try:
-        root = ET.fromstring(xml_text)
+        root = ET.fromstring(_clean_xml_payload(xml_text, root_name="alto"))
     except ET.ParseError:
         return ""
 
@@ -503,8 +673,9 @@ def _parse_mets_document(
     target_index: int | None,
 ) -> dict[str, Any]:
     """Parse METS and identify the image/ALTO files for one viewer page."""
+    cleaned_xml = _clean_xml_payload(xml_text, root_name="mets")
     try:
-        root = ET.fromstring(xml_text)
+        root = ET.fromstring(cleaned_xml)
     except ET.ParseError as exc:
         return {
             "ok": False,
@@ -1417,7 +1588,10 @@ class GalicianaOCRConnector:
                 else None
             )
 
-            mets_links: list[str] = []
+            mets_links = _discover_mets_urls_from_html(
+                response.text,
+                base_url=str(response.url),
+            )
             document_links: list[str] = []
             action_links: list[dict[str, str]] = []
             for anchor in raw_soup.select("a[href]"):
@@ -1429,33 +1603,12 @@ class GalicianaOCRConnector:
                 label = _normalise(label_raw)
                 if href and label_raw:
                     action_links.append({"label": label_raw, "url": href})
-                if href and ("mets" in label or "mets" in href.casefold()):
-                    if href not in mets_links:
-                        if "mets" in href.casefold():
-                            mets_links.insert(0, href)
-                        else:
-                            mets_links.append(href)
                 if href and (
                     href.casefold().endswith(".pdf")
                     or "pdf" in label
                     or "descargar grupo" in label
                 ) and href not in document_links:
                     document_links.append(href)
-
-            # Some DIGIBIB templates place download URLs in data-* attributes or scripts.
-            for element in raw_soup.find_all(True):
-                for attr_value in element.attrs.values():
-                    values = attr_value if isinstance(attr_value, list) else [attr_value]
-                    for value in values:
-                        if not isinstance(value, str) or "mets" not in value.casefold():
-                            continue
-                        candidate = _safe_discovered_url(value, base_url=str(response.url))
-                        if candidate and candidate not in mets_links:
-                            mets_links.append(candidate)
-            for match in re.finditer(r"[\"']([^\"']*mets[^\"']*)[\"']", response.text, re.I):
-                candidate = _safe_discovered_url(match.group(1), base_url=str(response.url))
-                if candidate and candidate not in mets_links:
-                    mets_links.append(candidate)
 
             mets_url = None
             mets_summary: dict[str, Any] | None = None
@@ -1466,14 +1619,77 @@ class GalicianaOCRConnector:
             discovered_ocr: list[str] = []
             discovered_pdfs: list[str] = []
 
-            for candidate in mets_links[:5]:
+            request_queue: list[dict[str, Any]] = [
+                {"method": "GET", "url": candidate, "data": {}}
+                for candidate in mets_links
+            ]
+            seen_requests: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+            processed = 0
+
+            while request_queue and processed < 12 and not mets_url:
+                request_spec = request_queue.pop(0)
+                method = str(request_spec.get("method", "GET")).upper()
+                candidate = str(request_spec.get("url", ""))
+                data = {
+                    str(key): str(value)
+                    for key, value in dict(request_spec.get("data", {})).items()
+                }
+                request_key = (method, candidate, tuple(sorted(data.items())))
+                if request_key in seen_requests:
+                    continue
+                seen_requests.add(request_key)
+                processed += 1
+
                 try:
-                    mets_response = await client.get(
-                        candidate,
-                        headers={"Referer": str(response.url)},
-                    )
+                    if method == "POST":
+                        mets_response = await client.post(
+                            candidate,
+                            data=data,
+                            headers={
+                                "Referer": str(response.url),
+                                "Origin": BASE_URL,
+                            },
+                        )
+                    else:
+                        mets_response = await client.get(
+                            candidate,
+                            params=data or None,
+                            headers={"Referer": str(response.url)},
+                        )
                     mets_response.raise_for_status()
-                    mets_response, _ = await _resolve_antibot(client, mets_response)
+                    mets_response, mets_solved = await _resolve_antibot(
+                        client, mets_response
+                    )
+                    solved = solved or mets_solved
+
+                    if not _contains_mets_xml(mets_response.text):
+                        # Galiciana's METS link can lead to an intermediate
+                        # export form. Follow its selected/default submission
+                        # and any concrete XML links before giving up.
+                        for form_request in _form_requests_from_html(
+                            mets_response.text,
+                            base_url=str(mets_response.url),
+                        ):
+                            request_queue.append(form_request)
+                        for discovered in _discover_mets_urls_from_html(
+                            mets_response.text,
+                            base_url=str(mets_response.url),
+                        ):
+                            if discovered != str(mets_response.url):
+                                request_queue.append(
+                                    {"method": "GET", "url": discovered, "data": {}}
+                                )
+                        preview = _compact(
+                            BeautifulSoup(
+                                mets_response.text, "html.parser"
+                            ).get_text(" ", strip=True)
+                        )[:240]
+                        recovery_errors.append(
+                            f"METS {candidate}: respuesta HTML intermedia sin XML"
+                            + (f" ({preview})" if preview else "")
+                        )
+                        continue
+
                     parsed_mets = _parse_mets_document(
                         mets_response.text,
                         base_url=str(mets_response.url),
@@ -1500,6 +1716,7 @@ class GalicianaOCRConnector:
                         "pdfs": len(parsed_mets["pdfs"]),
                         "grupos_paginas": len(parsed_mets.get("page_groups", [])),
                         "indice_pagina_objetivo": target_index,
+                        "solicitudes_exportacion": processed,
                     }
 
                     if alto_url:
@@ -1508,11 +1725,15 @@ class GalicianaOCRConnector:
                             headers={"Referer": mets_url},
                         )
                         alto_response.raise_for_status()
+                        alto_response, alto_solved = await _resolve_antibot(
+                            client, alto_response
+                        )
+                        solved = solved or alto_solved
                         alto_text = _extract_alto_text(alto_response.text)
-                    break
                 except Exception as exc:
                     recovery_errors.append(
-                        f"{candidate}: {type(exc).__name__}: {str(exc).strip() or repr(exc)}"
+                        f"{method} {candidate}: {type(exc).__name__}: "
+                        f"{str(exc).strip() or repr(exc)}"
                     )
 
         soup = BeautifulSoup(response.text, "html.parser")

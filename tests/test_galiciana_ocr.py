@@ -391,3 +391,71 @@ def test_antibot_payload_fallback_accepts_viewer_request(
     assert name == "cookiesession7001"
     assert value == "FFEE0011"
     assert extracted_payload == payload
+
+
+@pytest.mark.asyncio
+async def test_read_page_repairs_bare_ampersands_in_mets_urls() -> None:
+    malformed_mets = METS_FIXTURE.replace(
+        '/files/page4.xml',
+        '/files/page4.xml?download=1&format=alto',
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith('/catalogo_imagenes/grupo.do'):
+            return httpx.Response(200, text=VIEWER_HTML_WITH_METS)
+        if path.endswith('/catalogo_imagenes/descargar_mets.do'):
+            return httpx.Response(200, text=malformed_mets)
+        if path.endswith('/files/page4.xml'):
+            return httpx.Response(200, text=ALTO_FIXTURE)
+        raise AssertionError(f'Unexpected URL: {request.url}')
+
+    connector = GalicianaOCRConnector(transport=httpx.MockTransport(handler))
+    result = await connector.read_page(
+        'https://biblioteca.galiciana.gal/es/catalogo_imagenes/grupo.do?path=1356612&idImagen=13275824'
+    )
+
+    assert result['estado'] == 'ok'
+    assert result['lectura_completa'] is True
+    assert 'Manuel Pérez Eiriz' in result['texto_ocr']
+    assert 'format=alto' in result['ocr_url']
+
+
+@pytest.mark.asyncio
+async def test_read_page_submits_intermediate_mets_export_form() -> None:
+    viewer_html = VIEWER_HTML_WITH_METS.replace(
+        '../catalogo_imagenes/descargar_mets.do?path=1356612',
+        '../media/group/mets.do?path=1356612&posicion=1',
+    )
+    export_html = '''<!doctype html><html><body>
+      <h1>Exportar a METS</h1>
+      <form action="/es/media/group/export.do" method="post">
+        <input type="hidden" name="path" value="1356612">
+        <input type="hidden" name="posicion" value="1">
+        <button type="submit" name="accion" value="descargar">Descargar METS</button>
+      </form>
+    </body></html>'''
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith('/catalogo_imagenes/grupo.do'):
+            return httpx.Response(200, text=viewer_html)
+        if path.endswith('/media/group/mets.do'):
+            return httpx.Response(200, text=export_html)
+        if path.endswith('/media/group/export.do'):
+            assert request.method == 'POST'
+            assert b'path=1356612' in request.content
+            return httpx.Response(200, text=METS_FIXTURE)
+        if path.endswith('/files/page4.xml'):
+            return httpx.Response(200, text=ALTO_FIXTURE)
+        raise AssertionError(f'Unexpected URL: {request.url}')
+
+    connector = GalicianaOCRConnector(transport=httpx.MockTransport(handler))
+    result = await connector.read_page(
+        'https://biblioteca.galiciana.gal/es/catalogo_imagenes/grupo.do?path=1356612&idImagen=13275824'
+    )
+
+    assert result['estado'] == 'ok'
+    assert result['lectura_completa'] is True
+    assert result['mets_resumen']['solicitudes_exportacion'] == 2
+    assert 'Manuel Pérez Eiriz' in result['texto_ocr']
