@@ -44,7 +44,9 @@ async def test_connector_parses_sparql_json() -> None:
     }
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        assert "query" in request.url.params
+        assert request.method == "POST"
+        assert "query=" in request.content.decode("utf-8")
+        assert "query" not in request.url.params
         return httpx.Response(200, json=payload)
 
     connector = GalicianaBDGConnector(

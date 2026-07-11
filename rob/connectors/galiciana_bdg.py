@@ -183,7 +183,7 @@ class GalicianaBDGConnector(BaseConnector):
     async def _execute(self, sparql: str) -> dict[str, Any]:
         headers = {
             "Accept": "application/sparql-results+json, application/json",
-            "User-Agent": "RobGenealogia/0.3",
+            "User-Agent": "RobGenealogia/0.3.1",
         }
         async with httpx.AsyncClient(
             timeout=self.timeout,
@@ -191,9 +191,12 @@ class GalicianaBDGConnector(BaseConnector):
             transport=self.transport,
             headers=headers,
         ) as client:
-            response = await client.get(
+            # La consulta se envía en el cuerpo. Usar GET la incrusta en la
+            # URL y provoca HTTP 414 cuando la búsqueda contiene variantes,
+            # lugares y filtros cronológicos.
+            response = await client.post(
                 SPARQL_ENDPOINT,
-                params={
+                data={
                     "query": sparql,
                     "format": "application/sparql-results+json",
                 },
