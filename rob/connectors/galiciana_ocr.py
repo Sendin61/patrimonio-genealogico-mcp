@@ -9,6 +9,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
+from xml.etree import ElementTree as ET
 
 import httpx
 from bs4 import BeautifulSoup, Comment
@@ -419,6 +420,219 @@ def _safe_url(url: str) -> str:
         raise ValueError("La URL no pertenece a biblioteca.galiciana.gal.")
     return url
 
+
+
+def _local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].casefold()
+
+
+def _xml_href(element: ET.Element) -> str | None:
+    for key, value in element.attrib.items():
+        if key.casefold() == "href" or key.casefold().endswith("}href"):
+            return value.strip() or None
+    return None
+
+
+def _safe_discovered_url(url: str, *, base_url: str) -> str | None:
+    absolute = urljoin(base_url, url.strip())
+    parsed = urlparse(absolute)
+    hostname = (parsed.hostname or "").casefold()
+    if hostname != ALLOWED_HOST and not hostname.endswith(".galiciana.gal"):
+        return None
+    if parsed.scheme == "http":
+        parsed = parsed._replace(scheme="https")
+        absolute = parsed.geturl()
+    elif parsed.scheme != "https":
+        return None
+    return absolute
+
+
+def _extract_alto_text(xml_text: str) -> str:
+    """Extract reading-order text from an ALTO XML page."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return ""
+
+    lines: list[str] = []
+    for element in root.iter():
+        if _local_name(element.tag) != "textline":
+            continue
+        words: list[str] = []
+        for descendant in element.iter():
+            if _local_name(descendant.tag) != "string":
+                continue
+            content = descendant.attrib.get("CONTENT") or descendant.attrib.get("content")
+            if content:
+                words.append(content)
+        line = _compact(" ".join(words))
+        if line:
+            lines.append(line)
+
+    if not lines:
+        words = []
+        for element in root.iter():
+            if _local_name(element.tag) == "string":
+                content = element.attrib.get("CONTENT") or element.attrib.get("content")
+                if content:
+                    words.append(content)
+        return _compact(" ".join(words))
+
+    return "\n".join(lines).strip()
+
+
+def _viewer_page_ids(soup: BeautifulSoup) -> list[str]:
+    output: list[str] = []
+    for image in soup.select('img[src*="object-miniature.do?id="]'):
+        image_id = _query_value(urljoin(BASE_URL, image.get("src", "")), "id")
+        if image_id and image_id not in output:
+            output.append(image_id)
+    if not output:
+        for anchor in soup.select('a[id^="img"]'):
+            match = re.fullmatch(r"img(\d+)(?:-icon)?", anchor.get("id", ""))
+            if match and match.group(1) not in output:
+                output.append(match.group(1))
+    return output
+
+
+def _parse_mets_document(
+    xml_text: str,
+    *,
+    base_url: str,
+    target_image_id: str | None,
+    target_index: int | None,
+) -> dict[str, Any]:
+    """Parse METS and identify the image/ALTO files for one viewer page."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        return {
+            "ok": False,
+            "error": f"METS XML no válido: {exc}",
+            "images": [],
+            "ocr": [],
+            "pdfs": [],
+            "selected_image": None,
+            "selected_ocr": None,
+        }
+
+    files: list[dict[str, Any]] = []
+    files_by_id: dict[str, dict[str, Any]] = {}
+    for group in root.iter():
+        if _local_name(group.tag) != "filegrp":
+            continue
+        group_use = group.attrib.get("USE", "")
+        for file_element in group.iter():
+            if _local_name(file_element.tag) != "file":
+                continue
+            file_id = file_element.attrib.get("ID", "")
+            mime = file_element.attrib.get("MIMETYPE", "")
+            href = None
+            for child in file_element.iter():
+                if _local_name(child.tag) == "flocat":
+                    href = _xml_href(child)
+                    if href:
+                        break
+            if not href:
+                continue
+            absolute = _safe_discovered_url(href, base_url=base_url)
+            if not absolute:
+                continue
+            lowered = urlparse(absolute).path.casefold()
+            descriptor = _normalise(" ".join((group_use, mime, file_id, lowered)))
+            category = "other"
+            if "ocr" in descriptor or "alto" in descriptor:
+                category = "ocr"
+            elif "pdf" in descriptor or lowered.endswith(".pdf"):
+                category = "pdf"
+            elif mime.casefold().startswith("image/") or lowered.endswith((".jpg", ".jpeg", ".png", ".tif", ".tiff", ".jp2")):
+                category = "image"
+            elif mime.casefold() in {"text/xml", "application/xml"} or lowered.endswith(".xml"):
+                category = "ocr"
+
+            item = {
+                "id": file_id,
+                "url": absolute,
+                "mime": mime or None,
+                "use": group_use or None,
+                "category": category,
+            }
+            files.append(item)
+            if file_id:
+                files_by_id[file_id] = item
+
+    page_groups: list[list[str]] = []
+    for div in root.iter():
+        if _local_name(div.tag) != "div":
+            continue
+        refs: list[str] = []
+        child_div_has_refs = False
+        for child in list(div):
+            if _local_name(child.tag) == "fptr":
+                file_id = child.attrib.get("FILEID", "")
+                if file_id:
+                    refs.append(file_id)
+            elif _local_name(child.tag) == "div":
+                if any(_local_name(grand.tag) == "fptr" for grand in list(child)):
+                    child_div_has_refs = True
+        div_type = _normalise(div.attrib.get("TYPE", ""))
+        if refs and ("page" in div_type or "pagina" in div_type or not child_div_has_refs):
+            page_groups.append(refs)
+
+    images = [item for item in files if item["category"] == "image"]
+    ocr_files = [item for item in files if item["category"] == "ocr"]
+    pdfs = [item for item in files if item["category"] == "pdf"]
+
+    selected_image = None
+    if target_image_id:
+        for item in images:
+            if target_image_id in item["id"] or target_image_id in item["url"]:
+                selected_image = item
+                break
+    if selected_image is None and target_index is not None and 0 <= target_index < len(images):
+        selected_image = images[target_index]
+
+    selected_group: list[str] | None = None
+    if selected_image and selected_image["id"]:
+        for refs in page_groups:
+            if selected_image["id"] in refs:
+                selected_group = refs
+                break
+    if selected_group is None and target_image_id:
+        for refs in page_groups:
+            if any(target_image_id in ref for ref in refs):
+                selected_group = refs
+                break
+    if selected_group is None and target_index is not None and 0 <= target_index < len(page_groups):
+        selected_group = page_groups[target_index]
+
+    selected_ocr = None
+    if selected_group:
+        for ref in selected_group:
+            item = files_by_id.get(ref)
+            if item and item["category"] == "ocr":
+                selected_ocr = item
+                break
+    if selected_ocr is None and target_image_id:
+        for item in ocr_files:
+            if target_image_id in item["id"] or target_image_id in item["url"]:
+                selected_ocr = item
+                break
+    if selected_ocr is None and target_index is not None and 0 <= target_index < len(ocr_files):
+        selected_ocr = ocr_files[target_index]
+    if selected_ocr is None and len(ocr_files) == 1:
+        selected_ocr = ocr_files[0]
+
+    return {
+        "ok": True,
+        "error": None,
+        "images": images,
+        "ocr": ocr_files,
+        "pdfs": pdfs,
+        "page_groups": page_groups,
+        "selected_image": selected_image,
+        "selected_ocr": selected_ocr,
+    }
 
 def _query_value(url: str, name: str) -> str | None:
     values = parse_qs(urlparse(url).query).get(name)
@@ -1024,14 +1238,129 @@ class GalicianaOCRConnector:
         )
 
     async def read_page(self, page_url: str) -> dict[str, Any]:
-        """Open one Galiciana viewer page and extract visible text/media links."""
+        """Open a Galiciana page and recover its METS/ALTO text when exposed."""
         page_url = _safe_url(page_url)
+        target_image_id = _query_value(page_url, "idImagen")
+        recovery_errors: list[str] = []
+
         async with self._client() as client:
             response = await client.get(page_url, headers={"Referer": SEARCH_URL})
             response.raise_for_status()
             response, solved = await _resolve_antibot(client, response)
 
+            raw_soup = BeautifulSoup(response.text, "html.parser")
+            page_ids = _viewer_page_ids(raw_soup)
+            target_index = (
+                page_ids.index(target_image_id)
+                if target_image_id and target_image_id in page_ids
+                else None
+            )
+
+            mets_links: list[str] = []
+            document_links: list[str] = []
+            action_links: list[dict[str, str]] = []
+            for anchor in raw_soup.select("a[href]"):
+                href = _safe_discovered_url(
+                    anchor.get("href", ""),
+                    base_url=str(response.url),
+                )
+                label_raw = _compact(anchor.get_text(" ", strip=True))
+                label = _normalise(label_raw)
+                if href and label_raw:
+                    action_links.append({"label": label_raw, "url": href})
+                if href and ("mets" in label or "mets" in href.casefold()):
+                    if href not in mets_links:
+                        if "mets" in href.casefold():
+                            mets_links.insert(0, href)
+                        else:
+                            mets_links.append(href)
+                if href and (
+                    href.casefold().endswith(".pdf")
+                    or "pdf" in label
+                    or "descargar grupo" in label
+                ) and href not in document_links:
+                    document_links.append(href)
+
+            # Some DIGIBIB templates place download URLs in data-* attributes or scripts.
+            for element in raw_soup.find_all(True):
+                for attr_value in element.attrs.values():
+                    values = attr_value if isinstance(attr_value, list) else [attr_value]
+                    for value in values:
+                        if not isinstance(value, str) or "mets" not in value.casefold():
+                            continue
+                        candidate = _safe_discovered_url(value, base_url=str(response.url))
+                        if candidate and candidate not in mets_links:
+                            mets_links.append(candidate)
+            for match in re.finditer(r"[\"']([^\"']*mets[^\"']*)[\"']", response.text, re.I):
+                candidate = _safe_discovered_url(match.group(1), base_url=str(response.url))
+                if candidate and candidate not in mets_links:
+                    mets_links.append(candidate)
+
+            mets_url = None
+            mets_summary: dict[str, Any] | None = None
+            alto_text = ""
+            alto_url = None
+            page_image_url = None
+            discovered_images: list[str] = []
+            discovered_ocr: list[str] = []
+            discovered_pdfs: list[str] = []
+
+            for candidate in mets_links[:5]:
+                try:
+                    mets_response = await client.get(
+                        candidate,
+                        headers={"Referer": str(response.url)},
+                    )
+                    mets_response.raise_for_status()
+                    mets_response, _ = await _resolve_antibot(client, mets_response)
+                    parsed_mets = _parse_mets_document(
+                        mets_response.text,
+                        base_url=str(mets_response.url),
+                        target_image_id=target_image_id,
+                        target_index=target_index,
+                    )
+                    if not parsed_mets.get("ok"):
+                        recovery_errors.append(
+                            f"METS {candidate}: {parsed_mets.get('error')}"
+                        )
+                        continue
+
+                    mets_url = str(mets_response.url)
+                    discovered_images = [item["url"] for item in parsed_mets["images"]]
+                    discovered_ocr = [item["url"] for item in parsed_mets["ocr"]]
+                    discovered_pdfs = [item["url"] for item in parsed_mets["pdfs"]]
+                    selected_image = parsed_mets.get("selected_image")
+                    selected_ocr = parsed_mets.get("selected_ocr")
+                    page_image_url = selected_image["url"] if selected_image else None
+                    alto_url = selected_ocr["url"] if selected_ocr else None
+                    mets_summary = {
+                        "imagenes": len(parsed_mets["images"]),
+                        "ocr": len(parsed_mets["ocr"]),
+                        "pdfs": len(parsed_mets["pdfs"]),
+                        "grupos_paginas": len(parsed_mets.get("page_groups", [])),
+                        "indice_pagina_objetivo": target_index,
+                    }
+
+                    if alto_url:
+                        alto_response = await client.get(
+                            alto_url,
+                            headers={"Referer": mets_url},
+                        )
+                        alto_response.raise_for_status()
+                        alto_text = _extract_alto_text(alto_response.text)
+                    break
+                except Exception as exc:
+                    recovery_errors.append(
+                        f"{candidate}: {type(exc).__name__}: {str(exc).strip() or repr(exc)}"
+                    )
+
         soup = BeautifulSoup(response.text, "html.parser")
+        comment_texts: list[str] = []
+        for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
+            value = _compact(str(comment))
+            if len(value) >= 80 and "<" not in value[:20]:
+                comment_texts.append(value)
+
         for element in soup(["script", "style", "noscript"]):
             element.decompose()
 
@@ -1051,32 +1380,50 @@ class GalicianaOCRConnector:
                 if len(value) >= 30 and value not in seen_texts:
                     seen_texts.add(value)
                     targeted_texts.append(value)
+        for value in comment_texts:
+            if value not in seen_texts:
+                targeted_texts.append(value)
+                seen_texts.add(value)
 
-        images = []
+        images: list[str] = []
         for image in soup.select("img[src]"):
             source = urljoin(str(response.url), image.get("src", ""))
             if source and source not in images:
                 images.append(source)
+        for source in discovered_images:
+            if source not in images:
+                images.append(source)
 
-        documents = []
-        for anchor in soup.select("a[href]"):
-            href = urljoin(str(response.url), anchor.get("href", ""))
-            label = _normalise(anchor.get_text(" ", strip=True))
-            if href.lower().endswith(".pdf") or "pdf" in label:
-                if href not in documents:
-                    documents.append(href)
+        documents = list(document_links)
+        for source in [*discovered_pdfs, *mets_links]:
+            if source not in documents:
+                documents.append(source)
 
         visible_text = _compact(soup.get_text(" ", strip=True))
+        complete = bool(alto_text)
         return {
-            "estado": "ok",
+            "estado": "ok" if complete else "partial",
+            "lectura_completa": complete,
             "url": str(response.url),
             "anti_bot_resuelto": solved,
+            "id_imagen": target_image_id,
+            "indice_pagina": target_index,
+            "texto_ocr": alto_text[:120000],
+            "ocr_origen": "ALTO XML enlazado desde METS" if alto_text else None,
+            "ocr_url": alto_url,
+            "imagen_pagina": page_image_url,
+            "mets_url": mets_url,
+            "mets_resumen": mets_summary,
             "textos_ocr_posibles": targeted_texts[:20],
             "texto_visible": visible_text[:30000],
-            "imagenes": images[:100],
-            "documentos": documents[:30],
+            "imagenes": images[:200],
+            "ocr_descubierto": discovered_ocr[:200],
+            "documentos": documents[:100],
+            "acciones": action_links[:100],
+            "errores_recuperacion": recovery_errors[:20],
             "nota": (
-                "Si textos_ocr_posibles está vacío, el visor solo ha expuesto la "
-                "imagen y será necesaria una fase posterior de lectura visual/OCR."
+                "La lectura completa se considera verificada solo cuando texto_ocr "
+                "procede del ALTO XML asociado a la página en el METS. Si queda en "
+                "partial, la siguiente vía será descargar la imagen original y aplicar OCR."
             ),
         }

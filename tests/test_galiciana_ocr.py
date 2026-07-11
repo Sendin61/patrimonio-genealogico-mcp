@@ -250,3 +250,77 @@ async def test_connector_retries_remote_disconnect() -> None:
     assert report.status == "ok"
     assert report.diagnostics[0].attempts == 2
     assert report.total_unique == 2
+
+VIEWER_HTML_WITH_METS = """
+<!DOCTYPE html><html lang="es"><body>
+<h1>Boletín Oficial de la Provincia de Lugo: Número 79 - 1881 xullo 1</h1>
+<a href="../catalogo_imagenes/descargar_mets.do?path=1356612">Descargar formato METS</a>
+<a href="../catalogo_imagenes/descargar_grupo.do?path=1356612">Descargar grupo</a>
+<img src="../media/object-miniature.do?id=13275821">
+<img src="../media/object-miniature.do?id=13275822">
+<img src="../media/object-miniature.do?id=13275823">
+<img src="../media/object-miniature.do?id=13275824">
+</body></html>
+"""
+
+METS_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
+<mets:mets xmlns:mets="http://www.loc.gov/METS/" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <mets:fileSec>
+    <mets:fileGrp USE="images">
+      <mets:file ID="IMG1" MIMETYPE="image/jpeg"><mets:FLocat xlink:href="/files/page1.jpg"/></mets:file>
+      <mets:file ID="IMG2" MIMETYPE="image/jpeg"><mets:FLocat xlink:href="/files/page2.jpg"/></mets:file>
+      <mets:file ID="IMG3" MIMETYPE="image/jpeg"><mets:FLocat xlink:href="/files/page3.jpg"/></mets:file>
+      <mets:file ID="IMG4" MIMETYPE="image/jpeg"><mets:FLocat xlink:href="/files/page4.jpg"/></mets:file>
+    </mets:fileGrp>
+    <mets:fileGrp USE="ocr">
+      <mets:file ID="OCR1" MIMETYPE="text/xml"><mets:FLocat xlink:href="/files/page1.xml"/></mets:file>
+      <mets:file ID="OCR2" MIMETYPE="text/xml"><mets:FLocat xlink:href="/files/page2.xml"/></mets:file>
+      <mets:file ID="OCR3" MIMETYPE="text/xml"><mets:FLocat xlink:href="/files/page3.xml"/></mets:file>
+      <mets:file ID="OCR4" MIMETYPE="text/xml"><mets:FLocat xlink:href="/files/page4.xml"/></mets:file>
+    </mets:fileGrp>
+  </mets:fileSec>
+  <mets:structMap>
+    <mets:div TYPE="book">
+      <mets:div TYPE="page"><mets:fptr FILEID="IMG1"/><mets:fptr FILEID="OCR1"/></mets:div>
+      <mets:div TYPE="page"><mets:fptr FILEID="IMG2"/><mets:fptr FILEID="OCR2"/></mets:div>
+      <mets:div TYPE="page"><mets:fptr FILEID="IMG3"/><mets:fptr FILEID="OCR3"/></mets:div>
+      <mets:div TYPE="page"><mets:fptr FILEID="IMG4"/><mets:fptr FILEID="OCR4"/></mets:div>
+    </mets:div>
+  </mets:structMap>
+</mets:mets>
+"""
+
+ALTO_FIXTURE = """<?xml version="1.0" encoding="UTF-8"?>
+<alto xmlns="http://www.loc.gov/standards/alto/ns-v4#">
+  <Layout><Page><PrintSpace><TextBlock>
+    <TextLine><String CONTENT="Don"/><String CONTENT="Manuel"/><String CONTENT="Pérez"/><String CONTENT="Eiriz,"/></TextLine>
+    <TextLine><String CONTENT="Capitán"/><String CONTENT="graduado"/><String CONTENT="Teniente"/><String CONTENT="Ayudante."/></TextLine>
+  </TextBlock></PrintSpace></Page></Layout>
+</alto>
+"""
+
+
+@pytest.mark.asyncio
+async def test_read_page_recovers_target_alto_via_mets() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/catalogo_imagenes/grupo.do"):
+            return httpx.Response(200, text=VIEWER_HTML_WITH_METS)
+        if path.endswith("/catalogo_imagenes/descargar_mets.do"):
+            return httpx.Response(200, text=METS_FIXTURE, headers={"content-type": "application/xml"})
+        if path.endswith("/files/page4.xml"):
+            return httpx.Response(200, text=ALTO_FIXTURE, headers={"content-type": "application/xml"})
+        raise AssertionError(f"Unexpected URL: {request.url}")
+
+    connector = GalicianaOCRConnector(transport=httpx.MockTransport(handler))
+    result = await connector.read_page(
+        "https://biblioteca.galiciana.gal/es/catalogo_imagenes/grupo.do?path=1356612&idImagen=13275824"
+    )
+
+    assert result["estado"] == "ok"
+    assert result["lectura_completa"] is True
+    assert result["indice_pagina"] == 3
+    assert "Manuel Pérez Eiriz" in result["texto_ocr"]
+    assert result["ocr_url"].endswith("/files/page4.xml")
+    assert result["imagen_pagina"].endswith("/files/page4.jpg")
+    assert result["mets_resumen"]["ocr"] == 4

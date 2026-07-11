@@ -64,7 +64,7 @@ def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     return {
         "servidor": "Rob — Metabuscador Genealógico",
-        "version": "0.5.1",
+        "version": "0.5.2",
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "nota": "development no significa verificado; la prueba real se hace contra cada portal.",
@@ -161,7 +161,7 @@ async def leer_pagina_galiciana(url_pagina: str) -> dict[str, Any]:
     """
     Abre una página o visor de Galiciana devuelto por la búsqueda OCR.
 
-    Recupera el texto visible, posibles bloques OCR, imágenes y documentos PDF.
+    Recupera el texto de página desde METS/ALTO cuando está disponible, además de imágenes y documentos.
     Solo acepta direcciones HTTPS de biblioteca.galiciana.gal.
     """
     connector = GalicianaOCRConnector()
