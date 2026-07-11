@@ -9,6 +9,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 from rob.connectors.galiciana_bdg import GalicianaBDGConnector
+from rob.connectors.galiciana_ocr import GalicianaOCRConnector
 from rob.connectors.europeana_galicia import EuropeanaGaliciaConnector
 from rob.connectors.oai_pmh import (
     GALICIANA_ADG_OAI,
@@ -63,7 +64,7 @@ def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     return {
         "servidor": "Rob — Metabuscador Genealógico",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "nota": "development no significa verificado; la prueba real se hace contra cada portal.",
@@ -101,6 +102,70 @@ def expandir_busqueda_persona(
         profession=profesion or None,
     )
     return expand_query(query)
+
+
+@mcp.tool()
+async def investigar_persona_galiciana(
+    nombre: str,
+    variantes: list[str] | None = None,
+    lugares: list[str] | None = None,
+    fecha_desde: int | None = None,
+    fecha_hasta: int | None = None,
+    conyuge: str = "",
+    profesion: str = "",
+    max_consultas: int = 6,
+    max_resultados: int = 120,
+) -> dict[str, Any]:
+    """
+    Investiga una persona dentro del OCR real de Galiciana.
+
+    Genera variantes, recoge las páginas coincidentes, elimina duplicados,
+    puntúa posibles homónimos y organiza una cronología y hallazgos temáticos.
+    Los datos previos se usan únicamente para desambiguar: los hechos devueltos
+    deben proceder de los fragmentos y documentos de Galiciana.
+    """
+    query = GenealogyQuery(
+        name=nombre,
+        variants=variantes or [],
+        places=lugares or [],
+        year_from=fecha_desde,
+        year_to=fecha_hasta,
+        spouse=conyuge or None,
+        profession=profesion or None,
+    )
+    connector = GalicianaOCRConnector()
+    report = await connector.investigate(
+        query,
+        maximum_queries=max(1, min(max_consultas, 10)),
+        maximum_results=max(1, min(max_resultados, 300)),
+    )
+    return {
+        "fuente": "Galiciana — búsqueda OCR a texto completo",
+        "capacidad": (
+            "búsqueda dentro de páginas digitalizadas, extracción de fragmentos, "
+            "cronología e interpretación genealógica inicial"
+        ),
+        "estado": report.status,
+        "consultas_realizadas": report.queries,
+        "diagnostico": [asdict(item) for item in report.diagnostics],
+        "total_menciones_unicas": report.total_unique,
+        "hallazgos": report.findings,
+        "cronologia": report.chronology,
+        "menciones": [asdict(item) for item in report.mentions],
+        "nota_metodologica": report.note,
+    }
+
+
+@mcp.tool()
+async def leer_pagina_galiciana(url_pagina: str) -> dict[str, Any]:
+    """
+    Abre una página o visor de Galiciana devuelto por la búsqueda OCR.
+
+    Recupera el texto visible, posibles bloques OCR, imágenes y documentos PDF.
+    Solo acepta direcciones HTTPS de biblioteca.galiciana.gal.
+    """
+    connector = GalicianaOCRConnector()
+    return await connector.read_page(url_pagina)
 
 
 @mcp.tool()
