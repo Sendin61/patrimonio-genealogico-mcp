@@ -61,7 +61,7 @@ def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     return {
         "servidor": "Rob — Metabuscador Genealógico",
-        "version": "0.3.2",
+        "version": "0.3.3",
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "nota": "development no significa verificado; la prueba real se hace contra cada portal.",
@@ -127,12 +127,16 @@ async def buscar_galiciana_metadatos(
         profession=profesion or None,
     )
     connector = GalicianaBDGConnector()
-    results = await connector.search(query, limit=filas)
+    report = await connector.search_with_diagnostics(query, limit=filas)
     return {
         "fuente": "Galiciana. Biblioteca Dixital de Galicia",
         "capacidad": "metadatos SPARQL; no OCR interno",
-        "total": len(results),
-        "resultados": [asdict(result) for result in results],
+        "estado": report.status,
+        "peticiones_correctas": report.successful_requests,
+        "peticiones_fallidas": report.failed_requests,
+        "total": len(report.results),
+        "diagnostico": [asdict(item) for item in report.diagnostics],
+        "resultados": [asdict(result) for result in report.results],
     }
 
 

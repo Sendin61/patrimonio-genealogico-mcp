@@ -1,42 +1,31 @@
 import httpx
 import pytest
+from rdflib.plugins.sparql.parser import parseQuery
 
 from rob.connectors.galiciana_bdg import (
     GalicianaBDGConnector,
-    build_person_sparql,
-    build_term_sparql,
+    build_field_sparql,
 )
 from rob.models import GenealogyQuery
 
 
-def test_build_person_sparql_is_compact_and_has_dates() -> None:
-    query = GenealogyQuery(
-        name='Manuel "Pérez" Eiriz',
-        variants=["Pérez Eiriz, Manuel", "Manuel Perez Eiriz"],
-        places=["Merlán", "Chantada", "Lugo"],
-        year_from=1830,
-        year_to=1910,
+@pytest.mark.parametrize("field_name", ["author", "title", "description"])
+def test_queries_follow_official_field_patterns(field_name: str) -> None:
+    sparql = build_field_sparql(
+        "manuel pérez eiriz",
+        field_name,  # type: ignore[arg-type]
+        limit=20,
     )
-    sparql = build_person_sparql(query, limit=500)
 
-    assert "1830" in sparql
-    assert "1910" in sparql
-    assert "LIMIT 100" in sparql
-    assert "urn:galiciana:objetos-digitales" in sparql
-    assert len(sparql) < 1400
-
-
-def test_build_term_sparql_uses_one_term() -> None:
-    query = GenealogyQuery(name="Manuel Pérez Eiriz")
-    sparql = build_term_sparql(query, "manuel pérez eiriz", limit=20)
-
-    assert "manuel pérez eiriz" in sparql
-    assert "VALUES" not in sparql
-    assert len(sparql) < 1200
+    parseQuery(sparql)
+    assert "GRAPH <" not in sparql
+    assert "CONCAT(" not in sparql
+    assert "default-graph-uri" not in sparql
+    assert len(sparql) < 1500
 
 
 @pytest.mark.asyncio
-async def test_connector_uses_short_get_requests_and_deduplicates() -> None:
+async def test_connector_sends_default_graph_and_returns_results() -> None:
     payload = {
         "head": {"vars": ["obra", "titulo", "autor", "fecha", "shownAt"]},
         "results": {
@@ -46,34 +35,68 @@ async def test_connector_uses_short_get_requests_and_deduplicates() -> None:
                     "titulo": {"type": "literal", "value": "Manuel Pérez Eiriz"},
                     "autor": {"type": "literal", "value": "Pérez Eiriz, Manuel"},
                     "fecha": {"type": "literal", "value": "1879"},
-                    "shownAt": {"type": "uri", "value": "https://example.test/registro/1"},
+                    "shownAt": {
+                        "type": "uri",
+                        "value": "https://example.test/registro/1",
+                    },
                 }
             ]
         },
     }
-    requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
         assert request.method == "GET"
+        assert request.url.params["default-graph-uri"] == (
+            "urn:galiciana:objetos-digitales"
+        )
         assert "query" in request.url.params
-        assert len(str(request.url)) < 1900
         return httpx.Response(200, json=payload)
 
     connector = GalicianaBDGConnector(
-        transport=httpx.MockTransport(handler)
+        transport=httpx.MockTransport(handler),
     )
-    results = await connector.search(
+    report = await connector.search_with_diagnostics(
         GenealogyQuery(
             name="Manuel Pérez Eiriz",
-            variants=["Manuel Perez Eiriz", "Pérez Eiriz, Manuel"],
-            places=["Merlán", "Chantada", "Lugo"],
-            spouse="Ramona Sindín",
+            variants=["Pérez Eiriz, Manuel"],
+            year_from=1840,
+            year_to=1910,
         ),
         limit=20,
     )
 
-    assert 1 < len(requests) <= 4
-    assert len(results) == 1
-    assert results[0].url == "https://example.test/registro/1"
-    assert results[0].score >= 0.8
+    assert report.status == "ok"
+    assert report.successful_requests > 0
+    assert report.failed_requests == 0
+    assert len(report.results) == 1
+    assert report.results[0].url == "https://example.test/registro/1"
+
+
+@pytest.mark.asyncio
+async def test_timeout_is_reported_instead_of_blank_tool_failure() -> None:
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("", request=request)
+        return httpx.Response(
+            200,
+            json={"head": {"vars": []}, "results": {"bindings": []}},
+        )
+
+    connector = GalicianaBDGConnector(
+        transport=httpx.MockTransport(handler),
+    )
+    report = await connector.search_with_diagnostics(
+        GenealogyQuery(name="Manuel Pérez Eiriz"),
+        limit=20,
+    )
+
+    assert report.status == "partial"
+    assert report.failed_requests == 1
+    assert report.successful_requests > 0
+    failed = next(item for item in report.diagnostics if not item.ok)
+    assert failed.error_type == "ReadTimeout"
+    assert failed.error
