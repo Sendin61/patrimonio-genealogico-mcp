@@ -189,6 +189,8 @@ class OCRSearchDiagnostic:
     mentions_parsed: int = 0
     pages_read: int = 0
     challenge_solved: bool = False
+    attempts: int = 0
+    discarded_out_of_range: int = 0
     error_type: str | None = None
     error: str | None = None
 
@@ -297,6 +299,31 @@ def _extract_year(date: str | None) -> int | None:
         return None
     match = re.search(r"\b(1[6-9]\d{2}|20\d{2})\b", date)
     return int(match.group(1)) if match else None
+
+
+def _within_year_range(date: str | None, query: GenealogyQuery) -> bool:
+    """Apply the user's date interval as a real filter, not only a score hint."""
+    year = _extract_year(date)
+    if year is None:
+        return True
+    if query.year_from is not None and year < query.year_from:
+        return False
+    if query.year_to is not None and year > query.year_to:
+        return False
+    return True
+
+
+def _is_exact_full_phrase_query(text_query: str, query: GenealogyQuery) -> bool:
+    """True only for a quoted phrase containing the full canonical name."""
+    stripped = text_query.strip()
+    if not (stripped.startswith('"') and stripped.endswith('"')):
+        return False
+    if stripped.count('"') != 2 or "?" in stripped or "*" in stripped:
+        return False
+
+    query_tokens = re.findall(r"[\wÀ-ÿ'-]+", _normalise(stripped.strip('"')))
+    canonical_tokens = re.findall(r"[\wÀ-ÿ'-]+", _normalise(query.name))
+    return bool(canonical_tokens) and sorted(query_tokens) == sorted(canonical_tokens)
 
 
 def interpret_snippets(snippets: list[str]) -> list[OCRInterpretation]:
@@ -576,6 +603,31 @@ def _string_assignments(script: str) -> dict[str, str]:
     return assignments
 
 
+def _find_fwb_payload_fallback(*texts: str) -> str | None:
+    """Find the encoded original request even if the challenge JS changes shape."""
+    candidates: list[str] = []
+    for text in texts:
+        candidates.extend(
+            re.findall(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{80,}={0,2})(?![A-Za-z0-9+/=])", text)
+        )
+
+    for candidate in sorted(set(candidates), key=len, reverse=True):
+        try:
+            padded = candidate + "=" * (-len(candidate) % 4)
+            decoded = base64.b64decode(padded, validate=False).decode(
+                "utf-8",
+                errors="ignore",
+            )
+        except Exception:
+            continue
+        if (
+            "POST /es/consulta/resultados_ocr.do" in decoded
+            and "general_ocr=on" in decoded
+        ):
+            return candidate
+    return None
+
+
 def extract_antibot_challenge(html: str) -> tuple[str, str, str, str]:
     """Return endpoint, query-cookie name/value and fwb_dat payload."""
     soup = BeautifulSoup(html, "html.parser")
@@ -624,15 +676,18 @@ def extract_antibot_challenge(html: str) -> tuple[str, str, str, str]:
         r"(?:['\"](?P<literal>[A-Za-z0-9+/=]+)['\"]|(?P<variable>[A-Za-z_$][\w$]*))",
         script,
     )
-    if payload_match is None:
-        raise ValueError("No se pudo extraer fwb_dat del desafío anti-bot.")
+    payload = ""
+    if payload_match is not None:
+        payload = payload_match.group("literal") or assignments.get(
+            payload_match.group("variable") or "",
+            "",
+        )
 
-    payload = payload_match.group("literal") or assignments.get(
-        payload_match.group("variable") or "",
-        "",
-    )
     if not payload:
-        raise ValueError("El desafío anti-bot devolvió fwb_dat vacío.")
+        payload = _find_fwb_payload_fallback(script, packed) or ""
+
+    if not payload:
+        raise ValueError("No se pudo extraer fwb_dat del desafío anti-bot.")
 
     return urljoin(BASE_URL, endpoint), cookie_name, cookie_value, payload
 
@@ -668,11 +723,48 @@ async def _resolve_antibot(
     return current, solved
 
 
-def _mention_key(mention: GalicianaOCRMention) -> tuple[str, str, str]:
+def _mention_key(mention: GalicianaOCRMention) -> tuple[str, str]:
+    """One physical Galiciana page is one mention, regardless of query/snippet."""
     return (
-        mention.record_id,
+        mention.record_id or mention.title,
         mention.image_id or mention.page_url,
-        _normalise(" ".join(mention.snippets)),
+    )
+
+
+def _merge_mentions(
+    previous: GalicianaOCRMention,
+    current: GalicianaOCRMention,
+    query: GenealogyQuery,
+) -> GalicianaOCRMention:
+    snippets: list[str] = []
+    for value in [*previous.snippets, *current.snippets]:
+        normalised = _normalise(value)
+        if value and normalised not in {_normalise(item) for item in snippets}:
+            snippets.append(value)
+
+    score, reasons = _score_mention(
+        " ".join(snippets),
+        previous.date or current.date,
+        query,
+    )
+    best = current if current.score > previous.score else previous
+    return GalicianaOCRMention(
+        record_id=best.record_id,
+        title=best.title,
+        parent_publication=best.parent_publication,
+        date=best.date,
+        page=best.page,
+        record_url=best.record_url,
+        page_url=best.page_url,
+        digital_copy_url=best.digital_copy_url,
+        pdf_url=best.pdf_url,
+        path=best.path,
+        image_id=best.image_id,
+        snippets=snippets,
+        matched_query=best.matched_query,
+        score=score,
+        score_reasons=reasons,
+        interpretations=interpret_snippets(snippets),
     )
 
 
@@ -765,64 +857,91 @@ class GalicianaOCRConnector:
         genealogy_query: GenealogyQuery,
         maximum_results: int,
         maximum_pages: int,
+        retries: int = 2,
     ) -> tuple[list[GalicianaOCRMention], OCRSearchDiagnostic]:
         diagnostic = OCRSearchDiagnostic(query=text_query, ok=False)
-        try:
-            response = await client.post(
-                SEARCH_URL,
-                data={"general_ocr": "on", "busq_general": text_query},
-                headers={"Origin": BASE_URL, "Referer": SEARCH_REFERER},
-            )
-            response.raise_for_status()
-            response, solved = await _resolve_antibot(client, response)
-            diagnostic.challenge_solved = solved
+        last_exc: Exception | None = None
 
-            all_mentions: list[GalicianaOCRMention] = []
-            visited: set[str] = set()
-            current_url = str(response.url)
-            current_html = response.text
+        for attempt in range(1, max(1, retries) + 1):
+            diagnostic.attempts = attempt
+            try:
+                # Seed a normal browser-like session before submitting the form.
+                try:
+                    await client.get(SEARCH_REFERER)
+                except httpx.HTTPError:
+                    pass
 
-            for _ in range(maximum_pages):
-                parsed = parse_results_html(
-                    current_html,
-                    matched_query=text_query,
-                    genealogy_query=genealogy_query,
-                    current_url=current_url,
+                response = await client.post(
+                    SEARCH_URL,
+                    data={"general_ocr": "on", "busq_general": text_query},
+                    headers={"Origin": BASE_URL, "Referer": SEARCH_REFERER},
                 )
-                diagnostic.pages_read += 1
-                diagnostic.total_reported = max(
-                    diagnostic.total_reported,
-                    parsed.total_reported,
-                )
-                all_mentions.extend(parsed.mentions)
+                response.raise_for_status()
+                response, solved = await _resolve_antibot(client, response)
+                diagnostic.challenge_solved = diagnostic.challenge_solved or solved
 
-                if len(all_mentions) >= maximum_results or not parsed.next_url:
-                    break
-                if parsed.next_url in visited:
-                    break
-                visited.add(parsed.next_url)
+                all_mentions: list[GalicianaOCRMention] = []
+                visited: set[str] = set()
+                current_url = str(response.url)
+                current_html = response.text
 
-                next_response = await client.get(
-                    parsed.next_url,
-                    headers={"Referer": current_url},
-                )
-                next_response.raise_for_status()
-                next_response, next_solved = await _resolve_antibot(
-                    client,
-                    next_response,
-                )
-                diagnostic.challenge_solved = diagnostic.challenge_solved or next_solved
-                current_url = str(next_response.url)
-                current_html = next_response.text
+                for _ in range(maximum_pages):
+                    parsed = parse_results_html(
+                        current_html,
+                        matched_query=text_query,
+                        genealogy_query=genealogy_query,
+                        current_url=current_url,
+                    )
+                    diagnostic.pages_read += 1
+                    diagnostic.total_reported = max(
+                        diagnostic.total_reported,
+                        parsed.total_reported,
+                    )
 
-            diagnostic.ok = True
-            diagnostic.mentions_parsed = len(all_mentions[:maximum_results])
-            return all_mentions[:maximum_results], diagnostic
+                    for mention in parsed.mentions:
+                        if _within_year_range(mention.date, genealogy_query):
+                            all_mentions.append(mention)
+                        else:
+                            diagnostic.discarded_out_of_range += 1
 
-        except Exception as exc:
-            diagnostic.error_type = type(exc).__name__
-            diagnostic.error = str(exc).strip() or repr(exc)
-            return [], diagnostic
+                    if len(all_mentions) >= maximum_results or not parsed.next_url:
+                        break
+                    if parsed.next_url in visited:
+                        break
+                    visited.add(parsed.next_url)
+
+                    next_response = await client.get(
+                        parsed.next_url,
+                        headers={"Referer": current_url},
+                    )
+                    next_response.raise_for_status()
+                    next_response, next_solved = await _resolve_antibot(
+                        client,
+                        next_response,
+                    )
+                    diagnostic.challenge_solved = (
+                        diagnostic.challenge_solved or next_solved
+                    )
+                    current_url = str(next_response.url)
+                    current_html = next_response.text
+
+                diagnostic.ok = True
+                diagnostic.mentions_parsed = len(all_mentions[:maximum_results])
+                diagnostic.error_type = None
+                diagnostic.error = None
+                return all_mentions[:maximum_results], diagnostic
+
+            except Exception as exc:
+                last_exc = exc
+                diagnostic.error_type = type(exc).__name__
+                diagnostic.error = str(exc).strip() or repr(exc)
+                if attempt < retries:
+                    await asyncio.sleep(0.6 * attempt)
+
+        if last_exc is not None:
+            diagnostic.error_type = type(last_exc).__name__
+            diagnostic.error = str(last_exc).strip() or repr(last_exc)
+        return [], diagnostic
 
     async def investigate(
         self,
@@ -832,13 +951,22 @@ class GalicianaOCRConnector:
         maximum_results: int = 120,
         maximum_pages_per_query: int = 5,
     ) -> GalicianaOCRReport:
-        queries = build_ocr_queries(query, maximum=maximum_queries)
+        planned_queries = build_ocr_queries(query, maximum=maximum_queries)
+        executed_queries: list[str] = []
         diagnostics: list[OCRSearchDiagnostic] = []
-        unique: dict[tuple[str, str, str], GalicianaOCRMention] = {}
+        unique: dict[tuple[str, str], GalicianaOCRMention] = {}
 
-        async with self._client() as client:
-            for index, text_query in enumerate(queries):
-                remaining = max(1, maximum_results - len(unique))
+        # Once a full quoted name returns a substantial result set, broad
+        # surname/wildcard searches create more homonyms than useful evidence.
+        exact_hits = 0
+
+        for index, text_query in enumerate(planned_queries):
+            is_exact = _is_exact_full_phrase_query(text_query, query)
+            if not is_exact and exact_hits >= 5:
+                continue
+
+            remaining = max(1, maximum_results - len(unique))
+            async with self._client() as client:
                 mentions, diagnostic = await self._search_one(
                     client,
                     text_query=text_query,
@@ -846,16 +974,25 @@ class GalicianaOCRConnector:
                     maximum_results=remaining,
                     maximum_pages=maximum_pages_per_query,
                 )
-                diagnostics.append(diagnostic)
-                for mention in mentions:
-                    key = _mention_key(mention)
-                    previous = unique.get(key)
-                    if previous is None or mention.score > previous.score:
-                        unique[key] = mention
-                if len(unique) >= maximum_results:
-                    break
-                if index < len(queries) - 1:
-                    await asyncio.sleep(0.25)
+
+            executed_queries.append(text_query)
+            diagnostics.append(diagnostic)
+
+            if diagnostic.ok and is_exact:
+                exact_hits += len(mentions)
+
+            for mention in mentions:
+                key = _mention_key(mention)
+                previous = unique.get(key)
+                if previous is None:
+                    unique[key] = mention
+                else:
+                    unique[key] = _merge_mentions(previous, mention, query)
+
+            if len(unique) >= maximum_results:
+                break
+            if index < len(planned_queries) - 1:
+                await asyncio.sleep(0.35)
 
         mentions = sorted(
             unique.values(),
@@ -871,18 +1008,18 @@ class GalicianaOCRConnector:
 
         return GalicianaOCRReport(
             status=status,
-            queries=queries,
+            queries=executed_queries,
             diagnostics=diagnostics,
             mentions=mentions,
             findings=_aggregate_findings(mentions),
             chronology=_build_chronology(mentions),
             total_unique=len(mentions),
             note=(
-                "Los hechos se extraen exclusivamente de los fragmentos OCR y enlaces "
-                "devueltos por Galiciana. Los datos previos del usuario solo se usan "
-                "para puntuar y separar posibles homónimos. La lectura integral de cada "
-                "página se hará mediante leer_pagina_galiciana cuando el visor exponga "
-                "texto OCR recuperable."
+                "Cada página física se devuelve una sola vez aunque aparezca en "
+                "varias consultas. El intervalo cronológico se aplica como filtro "
+                "real. Las búsquedas amplias solo se ejecutan cuando las frases "
+                "exactas no producen suficientes resultados. Los hechos proceden "
+                "exclusivamente del OCR y de los documentos de Galiciana."
             ),
         )
 

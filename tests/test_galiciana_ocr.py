@@ -123,6 +123,8 @@ def test_extract_antibot_from_decoded_fixture(monkeypatch: pytest.MonkeyPatch) -
 @pytest.mark.asyncio
 async def test_connector_searches_and_returns_interpreted_report() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/es/consulta/busqueda.do"):
+            return httpx.Response(200, text="<html></html>")
         assert request.url.path.endswith("/es/consulta/resultados_ocr.do")
         return httpx.Response(200, text=FIXTURE_HTML)
 
@@ -145,3 +147,106 @@ async def test_connector_searches_and_returns_interpreted_report() -> None:
     assert report.diagnostics[0].ok is True
     assert report.findings
     assert report.chronology[0]["date"] == "1879-11-11"
+
+
+def test_antibot_payload_fallback_finds_encoded_original_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64
+
+    request_text = (
+        "POST /es/consulta/resultados_ocr.do HTTP/1.1\r\n"
+        "Host: biblioteca.galiciana.gal\r\n\r\n"
+        'general_ocr=on&busq_general=%22manuel+perez+eiriz%22'
+    )
+    payload = base64.b64encode(request_text.encode()).decode()
+    decoded = f"""
+    var cookieName="cookiesession8341";
+    var cookieEncoded="QUJDMTIz";
+    var url="/es/consulta/resultados_ocr.do";
+    url+="?"+cookieName+"="+decode(cookieEncoded);
+    var strange="{payload}";
+    var send_data=makePayload(strange);
+    """
+    monkeypatch.setattr(
+        "rob.connectors.galiciana_ocr.unpack_dean_edwards_packer",
+        lambda script: decoded,
+    )
+    html = "<html><script>eval(function(p,a,c,k,e,d){})</script></html>"
+
+    _, _, _, extracted = extract_antibot_challenge(html)
+    assert extracted == payload
+
+
+@pytest.mark.asyncio
+async def test_connector_deduplicates_pages_and_enforces_date_range() -> None:
+    out_of_range = FIXTURE_HTML.replace(
+        "El Miño : diario liberal: Año VII Número 1631 - 1904 mayo 3",
+        "El Miño : diario liberal: Año XX Número 5000 - 1935 mayo 3",
+    )
+
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        if request.url.path.endswith("/es/consulta/busqueda.do"):
+            return httpx.Response(200, text="<html></html>")
+        calls += 1
+        # First exact query returns both pages, second exact variant returns
+        # the same pages. The 1935 page must be filtered and the 1879 page
+        # must not be duplicated.
+        return httpx.Response(200, text=out_of_range)
+
+    connector = GalicianaOCRConnector(transport=httpx.MockTransport(handler))
+    report = await connector.investigate(
+        GenealogyQuery(
+            name="Manuel Pérez Eiriz",
+            variants=["Pérez Eiriz, Manuel"],
+            year_from=1870,
+            year_to=1910,
+        ),
+        maximum_queries=4,
+        maximum_results=20,
+    )
+
+    assert report.status == "ok"
+    assert report.total_unique == 1
+    assert report.mentions[0].date == "1879-11-11"
+    assert all(
+        mention.date is None or int(mention.date[:4]) <= 1910
+        for mention in report.mentions
+    )
+    assert sum(item.discarded_out_of_range for item in report.diagnostics) >= 1
+    # Broad queries are skipped once exact phrases yield enough hits.
+    assert all("?" not in item.query for item in report.diagnostics)
+
+
+@pytest.mark.asyncio
+async def test_connector_retries_remote_disconnect() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        if request.url.path.endswith("/es/consulta/busqueda.do"):
+            return httpx.Response(200, text="<html></html>")
+        attempts += 1
+        if attempts == 1:
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response."
+            )
+        return httpx.Response(200, text=FIXTURE_HTML)
+
+    connector = GalicianaOCRConnector(transport=httpx.MockTransport(handler))
+    report = await connector.investigate(
+        GenealogyQuery(
+            name="Manuel Pérez Eiriz",
+            year_from=1870,
+            year_to=1910,
+        ),
+        maximum_queries=1,
+        maximum_results=20,
+    )
+
+    assert report.status == "ok"
+    assert report.diagnostics[0].attempts == 2
+    assert report.total_unique == 2
