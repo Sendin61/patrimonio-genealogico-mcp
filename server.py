@@ -9,6 +9,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 from rob.connectors.galiciana_bdg import GalicianaBDGConnector
+from rob.connectors.europeana_galicia import EuropeanaGaliciaConnector
 from rob.connectors.oai_pmh import (
     GALICIANA_ADG_OAI,
     GALICIANA_BDG_OAI,
@@ -47,7 +48,8 @@ def _clean_europeana_item(item: dict[str, Any]) -> dict[str, Any]:
         "date": item.get("year", []) or item.get("dcDate", []),
         "description": item.get("dcDescription", []),
         "place": item.get("edmPlaceLabel", []),
-        "provider": item.get("dataProvider", []),
+        "provider": item.get("provider", []),
+        "data_provider": item.get("dataProvider", []),
         "country": item.get("country", []),
         "type": item.get("type"),
         "rights": item.get("rights", []),
@@ -61,7 +63,7 @@ def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     return {
         "servidor": "Rob — Metabuscador Genealógico",
-        "version": "0.3.3",
+        "version": "0.4.0",
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "nota": "development no significa verificado; la prueba real se hace contra cada portal.",
@@ -136,6 +138,48 @@ async def buscar_galiciana_metadatos(
         "peticiones_fallidas": report.failed_requests,
         "total": len(report.results),
         "diagnostico": [asdict(item) for item in report.diagnostics],
+        "resultados": [asdict(result) for result in report.results],
+    }
+
+
+@mcp.tool()
+async def buscar_galicia_europeana(
+    nombre: str,
+    variantes: list[str] | None = None,
+    lugares: list[str] | None = None,
+    fecha_desde: int | None = None,
+    fecha_hasta: int | None = None,
+    conyuge: str = "",
+    profesion: str = "",
+    filas: int = 20,
+) -> dict[str, Any]:
+    """
+    Busca personas en los metadatos de Galiciana cosechados por Europeana.
+
+    Fuente principal estable de Galicia durante la primera fase. No busca
+    todavía dentro del OCR de las páginas digitalizadas.
+    """
+    query = GenealogyQuery(
+        name=nombre,
+        variants=variantes or [],
+        places=lugares or [],
+        year_from=fecha_desde,
+        year_to=fecha_hasta,
+        spouse=conyuge or None,
+        profession=profesion or None,
+    )
+    connector = EuropeanaGaliciaConnector(_api_key())
+    report = await connector.search(query, limit=filas)
+    return {
+        "fuente": "Galiciana vía Europeana",
+        "capacidad": "metadatos de Galiciana; no OCR interno",
+        "estado": report.status,
+        "consulta_europeana": report.query,
+        "filtros": report.filters,
+        "total_api": report.total_api,
+        "total_devuelto": len(report.results),
+        "error_type": report.error_type,
+        "error": report.error,
         "resultados": [asdict(result) for result in report.results],
     }
 
