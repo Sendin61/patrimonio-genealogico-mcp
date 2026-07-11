@@ -6,7 +6,13 @@ from mcp.server.fastmcp import FastMCP
 EUROPEANA_SEARCH_URL = "https://api.europeana.eu/record/v2/search.json"
 EUROPEANA_RECORD_URL = "https://api.europeana.eu/record/v2/{record_id}.json"
 
-mcp = FastMCP("Patrimonio Genealógico MCP")
+mcp = FastMCP(
+    "Patrimonio Genealógico MCP",
+    host="0.0.0.0",
+    port=int(os.getenv("PORT", "8000")),
+    stateless_http=True,
+    json_response=True,
+)
 
 def _api_key() -> str:
     key = os.getenv("EUROPEANA_API_KEY", "").strip()
