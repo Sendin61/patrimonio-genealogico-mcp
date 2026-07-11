@@ -12,6 +12,7 @@ from ..query_expansion import expand_query
 
 SPARQL_ENDPOINT = "https://datos-abertos.galiciana.gal/arpad-bibdix-lod/sparql"
 OBJECTS_GRAPH = "urn:galiciana:objetos-digitales"
+MAX_TERMS = 4
 
 
 def _sparql_literal(value: str) -> str:
@@ -24,7 +25,7 @@ def _sparql_literal(value: str) -> str:
     return f'"{value}"'
 
 
-def _compact_terms(values: Iterable[str], maximum: int = 8) -> list[str]:
+def _compact_terms(values: Iterable[str], maximum: int = MAX_TERMS) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
 
@@ -40,68 +41,69 @@ def _compact_terms(values: Iterable[str], maximum: int = 8) -> list[str]:
     return result
 
 
-def build_person_sparql(query: GenealogyQuery, limit: int = 20) -> str:
-    limit = max(1, min(limit, 100))
-    terms = _compact_terms(expand_query(query))
-    if not terms:
-        terms = _compact_terms([query.name])
+def build_term_sparql(
+    query: GenealogyQuery,
+    term: str,
+    limit: int = 20,
+) -> str:
+    """
+    Construye una consulta SPARQL compacta para un único término.
 
-    values = " ".join(_sparql_literal(term) for term in terms)
+    Galiciana admite GET en su formulario público. Una consulta enorme con
+    todas las variantes en una sola URL puede provocar HTTP 414; por eso
+    cada variante se consulta por separado y luego se fusionan resultados.
+    """
+    limit = max(1, min(limit, 100))
+    term_literal = _sparql_literal(term.casefold())
     date_filters: list[str] = []
 
     if query.year_from is not None:
         date_filters.append(
-            f'(!BOUND(?fecha) || SUBSTR(STR(?fecha), 1, 4) >= "{query.year_from:04d}")'
+            f'(!BOUND(?fecha)||SUBSTR(STR(?fecha),1,4)>="{query.year_from:04d}")'
         )
     if query.year_to is not None:
         date_filters.append(
-            f'(!BOUND(?fecha) || SUBSTR(STR(?fecha), 1, 4) <= "{query.year_to:04d}")'
+            f'(!BOUND(?fecha)||SUBSTR(STR(?fecha),1,4)<="{query.year_to:04d}")'
         )
 
     date_clause = ""
     if date_filters:
-        date_clause = "\n  FILTER(" + " && ".join(date_filters) + ")"
+        date_clause = " FILTER(" + "&&".join(date_filters) + ")"
 
-    return f"""
-PREFIX dc: <http://purl.org/dc/elements/1.1/>
-PREFIX dcterms: <http://purl.org/dc/terms/>
-PREFIX edm: <http://www.europeana.eu/schemas/edm/>
-PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
-
-SELECT DISTINCT ?obra ?titulo ?autor ?fecha ?descripcion ?lugar ?shownAt
-WHERE {{
-  GRAPH <{OBJECTS_GRAPH}> {{
-    ?obra dc:title ?titulo .
-
-    OPTIONAL {{
-      ?obra dc:creator ?creator .
-      OPTIONAL {{ ?creator skos:prefLabel ?autor }}
-    }}
-    OPTIONAL {{ ?obra dc:date ?fecha }}
-    OPTIONAL {{ ?obra dc:description ?descripcion }}
-    OPTIONAL {{ ?obra dcterms:spatial ?lugar }}
-    OPTIONAL {{
-      ?aggregation edm:aggregatedCHO ?obra .
-      OPTIONAL {{ ?aggregation edm:isShownAt ?shownAt }}
-    }}
-
-    BIND(LCASE(STR(?titulo)) AS ?tituloTexto)
-    BIND(LCASE(COALESCE(STR(?autor), "")) AS ?autorTexto)
-    BIND(LCASE(COALESCE(STR(?descripcion), "")) AS ?descripcionTexto)
-    BIND(LCASE(COALESCE(STR(?lugar), "")) AS ?lugarTexto)
-
-    VALUES ?aguja {{ {values} }}
-
-    FILTER(
-      CONTAINS(?tituloTexto, ?aguja) ||
-      CONTAINS(?autorTexto, ?aguja) ||
-      CONTAINS(?descripcionTexto, ?aguja) ||
-      CONTAINS(?lugarTexto, ?aguja)
+    # Se mantiene deliberadamente compacto: el transporte es GET.
+    return (
+        "PREFIX dc:<http://purl.org/dc/elements/1.1/> "
+        "PREFIX dct:<http://purl.org/dc/terms/> "
+        "PREFIX edm:<http://www.europeana.eu/schemas/edm/> "
+        "PREFIX skos:<http://www.w3.org/2004/02/skos/core#> "
+        "SELECT DISTINCT ?obra ?titulo ?autor ?fecha ?descripcion ?lugar ?shownAt WHERE{"
+        f"GRAPH <{OBJECTS_GRAPH}>{{"
+        "?obra dc:title ?titulo."
+        "OPTIONAL{?obra dc:creator ?creator.OPTIONAL{?creator skos:prefLabel ?autor}}"
+        "OPTIONAL{?obra dc:date ?fecha}"
+        "OPTIONAL{?obra dc:description ?descripcion}"
+        "OPTIONAL{?obra dct:spatial ?lugarNodo."
+        "OPTIONAL{?lugarNodo skos:prefLabel ?lugar}}"
+        "OPTIONAL{?aggregation edm:aggregatedCHO ?obra."
+        "OPTIONAL{?aggregation edm:isShownAt ?shownAt}}"
+        "BIND(LCASE(CONCAT(STR(?titulo),' ',COALESCE(STR(?autor),''),' ',"
+        "COALESCE(STR(?descripcion),''),' ',COALESCE(STR(?lugar),''))) AS ?texto)"
+        f"FILTER(CONTAINS(?texto,{term_literal}))"
+        f"}}{date_clause}}}"
+        f" LIMIT {limit}"
     )
-  }}{date_clause}
-}}
-LIMIT {limit}
-""".strip()
+
+
+def build_person_sparql(query: GenealogyQuery, limit: int = 20) -> str:
+    """
+    Compatibilidad: devuelve la consulta compacta del primer término.
+
+    La búsqueda real usa varias consultas cortas mediante `search`.
+    """
+    terms = _compact_terms(expand_query(query))
+    if not terms:
+        terms = _compact_terms([query.name])
+    return build_term_sparql(query, terms[0], limit=limit)
 
 
 def _value(binding: dict[str, Any], key: str) -> str | None:
@@ -112,7 +114,12 @@ def _value(binding: dict[str, Any], key: str) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 
-def parse_sparql_results(payload: dict[str, Any], query: GenealogyQuery) -> list[SearchResult]:
+def parse_sparql_results(
+    payload: dict[str, Any],
+    query: GenealogyQuery,
+    *,
+    matched_term: str | None = None,
+) -> list[SearchResult]:
     bindings = payload.get("results", {}).get("bindings", [])
     if not isinstance(bindings, list):
         return []
@@ -147,6 +154,12 @@ def parse_sparql_results(payload: dict[str, Any], query: GenealogyQuery) -> list
         if author and name in author.casefold():
             score += 0.05
             reasons.append("coincidencia en autoría")
+        if matched_term and matched_term.casefold() in searchable:
+            reasons.append(f'coincidencia con "{matched_term}"')
+
+        raw = dict(binding)
+        if matched_term:
+            raw["_matched_term"] = matched_term
 
         results.append(
             SearchResult(
@@ -161,11 +174,20 @@ def parse_sparql_results(payload: dict[str, Any], query: GenealogyQuery) -> list
                 document_type="objeto bibliográfico digital",
                 score=min(score, 1.0),
                 score_reasons=reasons or ["coincidencia parcial en metadatos"],
-                raw=binding,
+                raw=raw,
             )
         )
 
     return results
+
+
+def _result_key(result: SearchResult) -> tuple[str, str, str]:
+    work_uri = _value(result.raw, "obra") or ""
+    return (
+        work_uri.casefold(),
+        result.title.casefold(),
+        (result.date or "").casefold(),
+    )
 
 
 class GalicianaBDGConnector(BaseConnector):
@@ -183,7 +205,7 @@ class GalicianaBDGConnector(BaseConnector):
     async def _execute(self, sparql: str) -> dict[str, Any]:
         headers = {
             "Accept": "application/sparql-results+json, application/json",
-            "User-Agent": "RobGenealogia/0.3.1",
+            "User-Agent": "RobGenealogia/0.3.2",
         }
         async with httpx.AsyncClient(
             timeout=self.timeout,
@@ -191,12 +213,11 @@ class GalicianaBDGConnector(BaseConnector):
             transport=self.transport,
             headers=headers,
         ) as client:
-            # La consulta se envía en el cuerpo. Usar GET la incrusta en la
-            # URL y provoca HTTP 414 cuando la búsqueda contiene variantes,
-            # lugares y filtros cronológicos.
-            response = await client.post(
+            # Galiciana rechaza el POST sin el flujo de su formulario (HTTP 403).
+            # Se usa GET, pero con consultas deliberadamente cortas.
+            response = await client.get(
                 SPARQL_ENDPOINT,
-                data={
+                params={
                     "query": sparql,
                     "format": "application/sparql-results+json",
                 },
@@ -214,18 +235,40 @@ class GalicianaBDGConnector(BaseConnector):
         query: GenealogyQuery,
         limit: int = 20,
     ) -> list[SearchResult]:
-        sparql = build_person_sparql(query, limit=limit)
-        payload = await self._execute(sparql)
-        return parse_sparql_results(payload, query)
+        limit = max(1, min(limit, 100))
+        terms = _compact_terms(expand_query(query))
+        if not terms:
+            terms = _compact_terms([query.name])
+
+        merged: dict[tuple[str, str, str], SearchResult] = {}
+
+        # Consultas secuenciales para no castigar el servicio público.
+        for term in terms:
+            sparql = build_term_sparql(query, term, limit=limit)
+            payload = await self._execute(sparql)
+            for result in parse_sparql_results(
+                payload,
+                query,
+                matched_term=term,
+            ):
+                key = _result_key(result)
+                previous = merged.get(key)
+                if previous is None or result.score > previous.score:
+                    merged[key] = result
+                elif previous is not None:
+                    for reason in result.score_reasons:
+                        if reason not in previous.score_reasons:
+                            previous.score_reasons.append(reason)
+
+        return sorted(
+            merged.values(),
+            key=lambda item: (-item.score, item.date or "", item.title),
+        )[:limit]
 
     async def healthcheck(self) -> dict[str, str | bool]:
-        sparql = f"""
-ASK {{
-  GRAPH <{OBJECTS_GRAPH}> {{
-    ?s ?p ?o
-  }}
-}}
-""".strip()
+        sparql = (
+            f"ASK{{GRAPH <{OBJECTS_GRAPH}>{{?s ?p ?o}}}}"
+        )
         payload = await self._execute(sparql)
         return {
             "source_id": self.source_id,
