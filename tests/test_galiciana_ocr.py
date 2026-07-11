@@ -459,3 +459,52 @@ async def test_read_page_submits_intermediate_mets_export_form() -> None:
     assert result['lectura_completa'] is True
     assert result['mets_resumen']['solicitudes_exportacion'] == 2
     assert 'Manuel Pérez Eiriz' in result['texto_ocr']
+
+@pytest.mark.asyncio
+async def test_read_page_follows_real_galiciana_export_mets_link() -> None:
+    viewer_html = VIEWER_HTML_WITH_METS.replace(
+        '../catalogo_imagenes/descargar_mets.do?path=1356612',
+        '../media/group/mets.do?path=1356612&posicion=1&destination=catalogo_imagenes%2Fgrupo.do%3Fpath%3D1356612',
+    )
+    export_html = '''<!DOCTYPE html><html lang="es"><body>
+      <div class="des_mets">
+        <a href="../../media/group/export-mets.do?path=1356612&amp;destination=catalogo_imagenes%2Fgrupo.do%3Fpath%3D1356612"
+           id="boton_export_mets">Exportar</a>
+      </div>
+    </body></html>'''
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith('/catalogo_imagenes/grupo.do'):
+            return httpx.Response(200, text=viewer_html)
+        if path.endswith('/media/group/mets.do'):
+            return httpx.Response(200, text=export_html)
+        if path.endswith('/media/group/export-mets.do'):
+            assert request.method == 'GET'
+            assert request.headers.get('referer', '').endswith(
+                '/es/media/group/mets.do?path=1356612&posicion=1&destination=catalogo_imagenes%2Fgrupo.do%3Fpath%3D1356612'
+            )
+            return httpx.Response(
+                200,
+                text=METS_FIXTURE,
+                headers={
+                    'content-type': 'application/xml',
+                    'content-disposition': 'attachment; filename="mets.xml"',
+                },
+            )
+        if path.endswith('/files/page4.xml'):
+            return httpx.Response(200, text=ALTO_FIXTURE)
+        raise AssertionError(f'Unexpected URL: {request.url}')
+
+    connector = GalicianaOCRConnector(transport=httpx.MockTransport(handler))
+    result = await connector.read_page(
+        'https://biblioteca.galiciana.gal/es/catalogo_imagenes/grupo.do?path=1356612&idImagen=13275824'
+    )
+
+    assert result['estado'] == 'ok'
+    assert result['lectura_completa'] is True
+    assert result['mets_url'].endswith(
+        '/es/media/group/export-mets.do?path=1356612&destination=catalogo_imagenes%2Fgrupo.do%3Fpath%3D1356612'
+    )
+    assert result['mets_resumen']['solicitudes_exportacion'] == 2
+    assert 'Manuel Pérez Eiriz' in result['texto_ocr']

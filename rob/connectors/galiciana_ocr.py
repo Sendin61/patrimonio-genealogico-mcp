@@ -509,7 +509,9 @@ def _looks_like_mets_url(url: str) -> bool:
     return (
         path.endswith(".xml")
         or path.endswith("/mets.do")
+        or path.endswith("/export-mets.do")
         or "/media/group/mets.do" in path
+        or "/media/group/export-mets.do" in path
         or "descargar_mets.do" in path
     )
 
@@ -1620,10 +1622,17 @@ class GalicianaOCRConnector:
             discovered_pdfs: list[str] = []
 
             request_queue: list[dict[str, Any]] = [
-                {"method": "GET", "url": candidate, "data": {}}
+                {
+                    "method": "GET",
+                    "url": candidate,
+                    "data": {},
+                    "referer": str(response.url),
+                }
                 for candidate in mets_links
             ]
-            seen_requests: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
+            seen_requests: set[
+                tuple[str, str, tuple[tuple[str, str], ...], str]
+            ] = set()
             processed = 0
 
             while request_queue and processed < 12 and not mets_url:
@@ -1634,7 +1643,15 @@ class GalicianaOCRConnector:
                     str(key): str(value)
                     for key, value in dict(request_spec.get("data", {})).items()
                 }
-                request_key = (method, candidate, tuple(sorted(data.items())))
+                request_referer = str(
+                    request_spec.get("referer") or response.url
+                )
+                request_key = (
+                    method,
+                    candidate,
+                    tuple(sorted(data.items())),
+                    request_referer,
+                )
                 if request_key in seen_requests:
                     continue
                 seen_requests.add(request_key)
@@ -1646,7 +1663,7 @@ class GalicianaOCRConnector:
                             candidate,
                             data=data,
                             headers={
-                                "Referer": str(response.url),
+                                "Referer": request_referer,
                                 "Origin": BASE_URL,
                             },
                         )
@@ -1654,7 +1671,7 @@ class GalicianaOCRConnector:
                         mets_response = await client.get(
                             candidate,
                             params=data or None,
-                            headers={"Referer": str(response.url)},
+                            headers={"Referer": request_referer},
                         )
                     mets_response.raise_for_status()
                     mets_response, mets_solved = await _resolve_antibot(
@@ -1670,6 +1687,7 @@ class GalicianaOCRConnector:
                             mets_response.text,
                             base_url=str(mets_response.url),
                         ):
+                            form_request["referer"] = str(mets_response.url)
                             request_queue.append(form_request)
                         for discovered in _discover_mets_urls_from_html(
                             mets_response.text,
@@ -1677,7 +1695,12 @@ class GalicianaOCRConnector:
                         ):
                             if discovered != str(mets_response.url):
                                 request_queue.append(
-                                    {"method": "GET", "url": discovered, "data": {}}
+                                    {
+                                        "method": "GET",
+                                        "url": discovered,
+                                        "data": {},
+                                        "referer": str(mets_response.url),
+                                    }
                                 )
                         preview = _compact(
                             BeautifulSoup(
