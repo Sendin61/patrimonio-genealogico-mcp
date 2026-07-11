@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: patrimonio-genealogico-mcp
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: EUROPEANA_API_KEY
+        sync: false
