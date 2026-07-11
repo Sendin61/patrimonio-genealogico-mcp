@@ -324,3 +324,70 @@ async def test_read_page_recovers_target_alto_via_mets() -> None:
     assert result["ocr_url"].endswith("/files/page4.xml")
     assert result["imagen_pagina"].endswith("/files/page4.jpg")
     assert result["mets_resumen"]["ocr"] == 4
+
+
+def test_antibot_uses_assignment_before_variable_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64
+
+    raw_request = (
+        "GET /es/catalogo_imagenes/grupo.do?path=1356612&idImagen=13275824 HTTP/1.1\r\n"
+        "Host: biblioteca.galiciana.gal\r\n\r\n"
+    )
+    payload = base64.b64encode(raw_request.encode()).decode()
+    decoded = f'''
+    var cookieName="cookiesession9123";
+    var token="QUJDMTIz";
+    var endpoint="/es/catalogo_imagenes/grupo.do";
+    endpoint+="?"+cookieName+"="+decode(token);
+    token="//79";
+    var requestPayload="{payload}";
+    var send_data="fwb_dat="+requestPayload;
+    '''
+    monkeypatch.setattr(
+        "rob.connectors.galiciana_ocr.unpack_dean_edwards_packer",
+        lambda script: decoded,
+    )
+    html = "<html><script>eval(function(p,a,c,k,e,d){})</script></html>"
+
+    endpoint, name, value, extracted_payload = extract_antibot_challenge(html)
+
+    assert endpoint.endswith(
+        "/es/catalogo_imagenes/grupo.do?path=1356612&idImagen=13275824"
+    )
+    assert name == "cookiesession9123"
+    assert value == "ABC123"
+    assert extracted_payload == payload
+
+
+def test_antibot_payload_fallback_accepts_viewer_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import base64
+
+    raw_request = (
+        "POST /es/catalogo_imagenes/descargar_mets.do?path=1356612 HTTP/1.1\r\n"
+        "Host: biblioteca.galiciana.gal\r\n\r\n"
+    )
+    payload = base64.b64encode(raw_request.encode()).decode()
+    decoded = f'''
+    var cookieName="cookiesession7001";
+    var token="RkZFRTAwMTE=";
+    var endpoint="/es/catalogo_imagenes/descargar_mets.do";
+    endpoint+="?"+cookieName+"="+decode(token);
+    var hiddenPayload="{payload}";
+    var send_data=wrap(hiddenPayload);
+    '''
+    monkeypatch.setattr(
+        "rob.connectors.galiciana_ocr.unpack_dean_edwards_packer",
+        lambda script: decoded,
+    )
+    html = "<html><script>eval(function(p,a,c,k,e,d){})</script></html>"
+
+    endpoint, name, value, extracted_payload = extract_antibot_challenge(html)
+
+    assert "descargar_mets.do?path=1356612" in endpoint
+    assert name == "cookiesession7001"
+    assert value == "FFEE0011"
+    assert extracted_payload == payload

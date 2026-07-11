@@ -55,7 +55,7 @@ SOURCES = (
         "biblioteca digital",
         status=SourceStatus.VERIFIED,
         connector="rob.connectors.galiciana_ocr.GalicianaOCRConnector",
-        notes="Búsqueda OCR real validada desde Render. Deduplica por página, aplica el intervalo cronológico y añade lectura de página mediante METS/ALTO cuando Galiciana lo expone.",
+        notes="Búsqueda OCR real validada desde Render. Deduplica por página y aplica el intervalo cronológico. El lector METS/ALTO sigue en validación frente a la protección anti-bot del visor.",
     ),
     SourceDefinition(
         "galiciana_adg",
@@ -73,7 +73,7 @@ SOURCES = (
         "hemeroteca",
         status=SourceStatus.VERIFIED,
         connector="rob.connectors.galiciana_ocr.GalicianaOCRConnector",
-        notes="Busca dentro del OCR y fue validado contra Galiciana desde Render; devuelve obra, página, fragmentos y recupera el ALTO XML asociado mediante el METS cuando está accesible.",
+        notes="Busca dentro del OCR y fue validado contra Galiciana desde Render; devuelve obra, página y fragmentos. La recuperación METS/ALTO está en fase de validación.",
     ),
     SourceDefinition("madrid", "Fuentes digitales de Madrid", "Comunidad de Madrid", "autonómica"),
     SourceDefinition("murcia", "Fuentes digitales de Murcia", "Región de Murcia", "autonómica"),

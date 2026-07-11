@@ -64,7 +64,7 @@ def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     return {
         "servidor": "Rob — Metabuscador Genealógico",
-        "version": "0.5.2",
+        "version": "0.5.3",
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "nota": "development no significa verificado; la prueba real se hace contra cada portal.",

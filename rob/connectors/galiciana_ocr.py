@@ -802,48 +802,124 @@ def _decode_js_string(value: str, quote: str) -> str:
         return value.replace(r"\/", "/").replace(r"\'", "'").replace(r'\"', '"')
 
 
-def _string_assignments(script: str) -> dict[str, str]:
-    assignments: dict[str, str] = {}
+def _string_assignment_history(script: str) -> list[tuple[str, str, int]]:
+    """Preserve every literal assignment and its position.
+
+    The remote protection reuses short variable names. Keeping only the last
+    value can therefore replace the encoded session token with an unrelated
+    later assignment.
+    """
+    history: list[tuple[str, str, int]] = []
     pattern = re.compile(
         r"(?:\bvar\s+)?([A-Za-z_$][\w$]*)\s*=\s*"
         r"(?P<quote>['\"])(?P<value>(?:\\.|(?!\2).)*?)(?P=quote)\s*;",
         flags=re.DOTALL,
     )
     for match in pattern.finditer(script):
-        assignments[match.group(1)] = _decode_js_string(
-            match.group("value"),
-            match.group("quote"),
+        history.append(
+            (
+                match.group(1),
+                _decode_js_string(match.group("value"), match.group("quote")),
+                match.start(),
+            )
         )
+    return history
+
+
+def _string_assignments(script: str) -> dict[str, str]:
+    """Compatibility view containing the final value of each variable."""
+    assignments: dict[str, str] = {}
+    for name, value, _ in _string_assignment_history(script):
+        assignments[name] = value
     return assignments
 
 
-def _find_fwb_payload_fallback(*texts: str) -> str | None:
-    """Find the encoded original request even if the challenge JS changes shape."""
-    candidates: list[str] = []
-    for text in texts:
-        candidates.extend(
-            re.findall(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{80,}={0,2})(?![A-Za-z0-9+/=])", text)
-        )
+def _assignment_before(
+    history: list[tuple[str, str, int]],
+    variable: str,
+    position: int,
+) -> str:
+    values = [value for name, value, offset in history if name == variable and offset < position]
+    return values[-1] if values else ""
 
-    for candidate in sorted(set(candidates), key=len, reverse=True):
-        try:
-            padded = candidate + "=" * (-len(candidate) % 4)
-            decoded = base64.b64decode(padded, validate=False).decode(
-                "utf-8",
-                errors="ignore",
-            )
-        except Exception:
-            continue
-        if (
-            "POST /es/consulta/resultados_ocr.do" in decoded
-            and "general_ocr=on" in decoded
-        ):
-            return candidate
+
+def _decode_base64_text(value: str) -> str | None:
+    """Decode the protection's Base64 token without assuming one alphabet."""
+    candidate = value.strip().replace(r"\/", "/")
+    if not candidate:
+        return None
+    variants = [candidate, candidate.replace("-", "+").replace("_", "/")]
+    for variant in variants:
+        padded = variant + "=" * (-len(variant) % 4)
+        for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+            try:
+                raw = decoder(padded)
+            except Exception:
+                continue
+            for encoding in ("utf-8", "latin-1"):
+                try:
+                    text = raw.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+                readable = sum(
+                    char.isprintable() or char in "\r\n\t" for char in text
+                )
+                if text and readable / len(text) >= 0.95:
+                    return text
     return None
 
 
+def _find_fwb_payload_fallback(*texts: str) -> str | None:
+    """Find an encoded raw Galiciana request for any protected endpoint."""
+    candidates: list[str] = []
+    for text in texts:
+        candidates.extend(
+            re.findall(
+                r"(?<![A-Za-z0-9+/=_-])([A-Za-z0-9+/_-]{48,}={0,2})(?![A-Za-z0-9+/=_-])",
+                text,
+            )
+        )
+
+    for candidate in sorted(set(candidates), key=len, reverse=True):
+        decoded = _decode_base64_text(candidate)
+        if not decoded:
+            continue
+        if re.search(r"^(?:GET|POST)\s+/\S*\.do(?:\?\S*)?\s+HTTP/1\.[01]", decoded):
+            if "Host: biblioteca.galiciana.gal" in decoded:
+                return candidate
+    return None
+
+
+def _cookie_candidate_from_history(
+    history: list[tuple[str, str, int]],
+    *,
+    before: int,
+) -> str | None:
+    """Recover a session token when obfuscated variable reuse breaks direct lookup."""
+    ranked: list[tuple[int, int, str]] = []
+    for _, encoded, position in history:
+        if position >= before:
+            continue
+        decoded = _decode_base64_text(encoded)
+        if not decoded or "HTTP/" in decoded or any(char.isspace() for char in decoded):
+            continue
+        score = 0
+        if re.fullmatch(r"[A-Fa-f0-9]{16,128}", decoded):
+            score = 100
+        elif re.fullmatch(r"[A-Za-z0-9._:-]{12,160}", decoded):
+            score = 70
+        elif 8 <= len(decoded) <= 200:
+            score = 40
+        if score:
+            ranked.append((score, position, decoded))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)
+    return ranked[0][2]
+
+
 def extract_antibot_challenge(html: str) -> tuple[str, str, str, str]:
-    """Return endpoint, query-cookie name/value and fwb_dat payload."""
+    """Return endpoint, query-session name/value and fwb_dat payload."""
     soup = BeautifulSoup(html, "html.parser")
     packed = "\n".join(
         element.get_text("\n", strip=False)
@@ -854,16 +930,47 @@ def extract_antibot_challenge(html: str) -> tuple[str, str, str, str]:
         raise ValueError("La respuesta no contiene el desafío anti-bot esperado.")
 
     script = unpack_dean_edwards_packer(packed)
+    history = _string_assignment_history(script)
     assignments = _string_assignments(script)
 
-    endpoint = next(
-        (
-            value
-            for value in assignments.values()
-            if "resultados_ocr.do" in value
-        ),
-        "/es/consulta/resultados_ocr.do",
+    payload_match = re.search(
+        r"['\"]fwb_dat=['\"]\s*\+\s*"
+        r"(?:['\"](?P<literal>[A-Za-z0-9+/_=-]+)['\"]|(?P<variable>[A-Za-z_$][\w$]*))",
+        script,
     )
+    payload = ""
+    if payload_match is not None:
+        if payload_match.group("literal"):
+            payload = payload_match.group("literal") or ""
+        else:
+            payload = _assignment_before(
+                history,
+                payload_match.group("variable") or "",
+                payload_match.start(),
+            ) or assignments.get(payload_match.group("variable") or "", "")
+    if not payload:
+        payload = _find_fwb_payload_fallback(script, packed) or ""
+    if not payload:
+        raise ValueError("No se pudo extraer fwb_dat del desafío anti-bot.")
+
+    decoded_request = _decode_base64_text(payload) or ""
+    request_path_match = re.search(
+        r"^(?:GET|POST)\s+(?P<path>/\S*?\.do(?:\?\S*)?)\s+HTTP/1\.[01]",
+        decoded_request,
+    )
+
+    endpoint = ""
+    if request_path_match:
+        endpoint = request_path_match.group("path")
+    if not endpoint:
+        endpoint = next(
+            (
+                value
+                for _, value, _ in history
+                if value.startswith("/") and ".do" in value
+            ),
+            "/es/consulta/resultados_ocr.do",
+        )
 
     cookie_match = re.search(
         r"\+=\s*['\"]\?['\"]\s*\+\s*([A-Za-z_$][\w$]*)\s*"
@@ -871,40 +978,40 @@ def extract_antibot_challenge(html: str) -> tuple[str, str, str, str]:
         r"([A-Za-z_$][\w$]*)\)",
         script,
     )
-    if cookie_match is None:
-        raise ValueError("No se pudo extraer el parámetro de sesión anti-bot.")
+    cookie_position = cookie_match.start() if cookie_match else len(script)
 
-    cookie_name = assignments.get(cookie_match.group(1), "")
-    encoded_cookie_value = assignments.get(cookie_match.group(2), "")
-    if not cookie_name or not encoded_cookie_value:
-        raise ValueError("El desafío anti-bot no contiene una sesión utilizable.")
-
-    try:
-        padded_cookie = encoded_cookie_value + "=" * (-len(encoded_cookie_value) % 4)
-        cookie_value = base64.b64decode(padded_cookie).decode("utf-8")
-    except Exception as exc:  # pragma: no cover - depends on remote challenge
-        raise ValueError("No se pudo decodificar la sesión anti-bot.") from exc
-
-    payload_match = re.search(
-        r"['\"]fwb_dat=['\"]\s*\+\s*"
-        r"(?:['\"](?P<literal>[A-Za-z0-9+/=]+)['\"]|(?P<variable>[A-Za-z_$][\w$]*))",
-        script,
-    )
-    payload = ""
-    if payload_match is not None:
-        payload = payload_match.group("literal") or assignments.get(
-            payload_match.group("variable") or "",
-            "",
+    cookie_name = ""
+    encoded_cookie_value = ""
+    if cookie_match is not None:
+        cookie_name = _assignment_before(history, cookie_match.group(1), cookie_position)
+        encoded_cookie_value = _assignment_before(
+            history,
+            cookie_match.group(2),
+            cookie_position,
         )
 
-    if not payload:
-        payload = _find_fwb_payload_fallback(script, packed) or ""
+    if not cookie_name:
+        cookie_name = next(
+            (
+                value
+                for _, value, _ in history
+                if re.fullmatch(r"cookiesession\d+", value, re.IGNORECASE)
+            ),
+            "",
+        )
+    if not cookie_name:
+        direct_cookie = re.search(r"cookiesession\d+", script, re.IGNORECASE)
+        cookie_name = direct_cookie.group(0) if direct_cookie else ""
+    if not cookie_name:
+        raise ValueError("No se pudo extraer el parámetro de sesión anti-bot.")
 
-    if not payload:
-        raise ValueError("No se pudo extraer fwb_dat del desafío anti-bot.")
+    cookie_value = _decode_base64_text(encoded_cookie_value) if encoded_cookie_value else None
+    if not cookie_value or "HTTP/" in cookie_value or any(char.isspace() for char in cookie_value):
+        cookie_value = _cookie_candidate_from_history(history, before=cookie_position)
+    if not cookie_value:
+        raise ValueError("No se pudo decodificar la sesión anti-bot.")
 
     return urljoin(BASE_URL, endpoint), cookie_name, cookie_value, payload
-
 
 def _is_antibot_page(html: str) -> bool:
     return "eval(function(p" in html and "fwb_dat" in html
@@ -1244,9 +1351,63 @@ class GalicianaOCRConnector:
         recovery_errors: list[str] = []
 
         async with self._client() as client:
-            response = await client.get(page_url, headers={"Referer": SEARCH_URL})
-            response.raise_for_status()
-            response, solved = await _resolve_antibot(client, response)
+            # The viewer and METS download are more likely to challenge a cold
+            # server session than the search form. Prime the same session first.
+            for seed_url in (f"{BASE_URL}/es/inicio/inicio.do", SEARCH_REFERER):
+                try:
+                    seed_response = await client.get(seed_url)
+                    seed_response.raise_for_status()
+                    if _is_antibot_page(seed_response.text):
+                        await _resolve_antibot(client, seed_response)
+                except Exception as exc:
+                    recovery_errors.append(
+                        f"sesión inicial {seed_url}: {type(exc).__name__}: "
+                        f"{str(exc).strip() or repr(exc)}"
+                    )
+
+            response = None
+            solved = False
+            last_viewer_error: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    candidate_response = await client.get(
+                        page_url,
+                        headers={"Referer": SEARCH_URL},
+                    )
+                    candidate_response.raise_for_status()
+                    candidate_response, attempt_solved = await _resolve_antibot(
+                        client, candidate_response
+                    )
+                    solved = solved or attempt_solved
+                    response = candidate_response
+                    break
+                except Exception as exc:
+                    last_viewer_error = exc
+                    recovery_errors.append(
+                        f"visor intento {attempt}: {type(exc).__name__}: "
+                        f"{str(exc).strip() or repr(exc)}"
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(0.5 * attempt)
+
+            if response is None:
+                return {
+                    "estado": "unavailable",
+                    "lectura_completa": False,
+                    "url": page_url,
+                    "anti_bot_resuelto": solved,
+                    "id_imagen": target_image_id,
+                    "texto_ocr": "",
+                    "ocr_url": None,
+                    "imagen_pagina": None,
+                    "mets_url": None,
+                    "errores_recuperacion": recovery_errors[-20:],
+                    "error": (
+                        f"{type(last_viewer_error).__name__}: {last_viewer_error}"
+                        if last_viewer_error
+                        else "No se pudo abrir el visor."
+                    ),
+                }
 
             raw_soup = BeautifulSoup(response.text, "html.parser")
             page_ids = _viewer_page_ids(raw_soup)
