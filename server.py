@@ -841,7 +841,28 @@ def _openapi_schema() -> dict[str, Any]:
                 "responses": {
                     "200": {
                         "description": "Operación completada.",
-                        "content": {"application/json": {"schema": {"type": "object", "additionalProperties": True}}},
+                        "content": {
+    "application/json": {
+        "schema": {
+            "type": "object",
+            "properties": {
+                "estado": {
+                    "type": "string",
+                    "description": "Estado de la operación, cuando esté disponible.",
+                },
+                "investigation_id": {
+                    "type": "string",
+                    "description": "Identificador del expediente, cuando corresponda.",
+                },
+                "error": {
+                    "type": "string",
+                    "description": "Descripción del error, cuando se produzca.",
+                },
+            },
+            "additionalProperties": True,
+        }
+    }
+},
                     },
                     "422": {"description": "Datos incompletos o investigación caducada."},
                     "502": {"description": "La fuente remota no respondió correctamente."},
