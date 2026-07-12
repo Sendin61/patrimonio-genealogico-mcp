@@ -21,6 +21,7 @@ from rob.connectors.oai_pmh import (
     OAIClient,
 )
 from rob.models import GenealogyQuery
+from rob.galiciana_investigations import get_default_engine
 from rob.query_expansion import expand_query
 from rob.registry import list_registered_sources
 from rob.sources import source_summary
@@ -159,12 +160,37 @@ def _compact_galiciana_report(report: Any, *, maximum_results: int) -> dict[str,
     }
 
 
+def _query_from_payload(payload: dict[str, Any]) -> GenealogyQuery:
+    nombre = str(payload.get("nombre") or "").strip()
+    if not nombre:
+        raise ValueError("Falta el campo obligatorio nombre.")
+    variantes = [
+        str(value).strip()
+        for value in payload.get("variantes", [])
+        if str(value).strip()
+    ]
+    lugares = [
+        str(value).strip()
+        for value in payload.get("lugares", [])
+        if str(value).strip()
+    ]
+    return GenealogyQuery(
+        name=nombre,
+        variants=variantes,
+        places=lugares,
+        year_from=payload.get("fecha_desde"),
+        year_to=payload.get("fecha_hasta"),
+        spouse=str(payload.get("conyuge") or "").strip() or None,
+        profession=str(payload.get("profesion") or "").strip() or None,
+    )
+
+
 @mcp.tool()
 def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     return {
         "servidor": "Rob — Metabuscador Genealógico",
-        "version": "0.6.1",
+        "version": "0.7.0",
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "actions_configuradas": True,
@@ -216,7 +242,7 @@ async def investigar_persona_galiciana(
     profesion: str = "",
     max_consultas: int = 6,
     max_resultados: int = 120,
-    leer_paginas_completas: bool = True,
+    leer_paginas_completas: bool = False,
     max_paginas_completas: int = 40,
     concurrencia_lectura: int = 2,
 ) -> dict[str, Any]:
@@ -294,6 +320,81 @@ async def leer_pagina_galiciana(url_pagina: str) -> dict[str, Any]:
     """
     connector = GalicianaOCRConnector()
     return await connector.read_page(url_pagina)
+
+
+@mcp.tool()
+async def crear_investigacion_galiciana(
+    nombre: str,
+    variantes: list[str] | None = None,
+    lugares: list[str] | None = None,
+    fecha_desde: int | None = None,
+    fecha_hasta: int | None = None,
+    conyuge: str = "",
+    profesion: str = "",
+    max_consultas: int = 8,
+    max_resultados: int = 80,
+) -> dict[str, Any]:
+    """Crea un expediente reanudable: busca, deduplica y deja las páginas pendientes de lectura ALTO."""
+    query = GenealogyQuery(
+        name=nombre,
+        variants=variantes or [],
+        places=lugares or [],
+        year_from=fecha_desde,
+        year_to=fecha_hasta,
+        spouse=conyuge or None,
+        profession=profesion or None,
+    )
+    return await get_default_engine().create_investigation(
+        query,
+        maximum_queries=max_consultas,
+        maximum_results=max_resultados,
+    )
+
+
+@mcp.tool()
+async def procesar_investigacion_galiciana(
+    investigation_id: str,
+    paginas_por_lote: int = 5,
+    presupuesto_segundos: int = 40,
+    leer_adyacentes: bool = True,
+) -> dict[str, Any]:
+    """Lee el siguiente lote con una sesión compartida, caché, reintentos y reanudación."""
+    return await get_default_engine().process(
+        investigation_id,
+        batch_size=paginas_por_lote,
+        time_budget_seconds=presupuesto_segundos,
+        read_adjacent=leer_adyacentes,
+    )
+
+
+@mcp.tool()
+def obtener_informe_galiciana(
+    investigation_id: str,
+    desde: int = 0,
+    max_resultados: int = 20,
+    incluir_no_leidas: bool = True,
+) -> dict[str, Any]:
+    """Devuelve evidencias ALTO, cobertura, errores y relaciones familiares explícitas."""
+    return get_default_engine().report(
+        investigation_id,
+        maximum_results=max_resultados,
+        offset=desde,
+        include_unread=incluir_no_leidas,
+    )
+
+
+@mcp.tool()
+async def crear_investigacion_familiar_galiciana(
+    investigation_id_origen: str,
+    nombre_familiar: str,
+    max_resultados: int = 40,
+) -> dict[str, Any]:
+    """Abre un expediente para un familiar que ya fue mencionado explícitamente en una fuente leída."""
+    return await get_default_engine().create_family_investigation(
+        investigation_id_origen,
+        nombre_familiar,
+        maximum_results=max_resultados,
+    )
 
 
 @mcp.tool()
@@ -453,9 +554,11 @@ async def health_route(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "Rob — Investigador Genealógico",
-            "version": "0.6.1",
+            "version": "0.7.0",
             "mcp": f"{PUBLIC_BASE_URL}/mcp",
             "openapi": f"{PUBLIC_BASE_URL}/openapi.json",
+            "motor_expedientes": True,
+            "persistencia": "SQLite; durable si ROB_DB_PATH apunta a un disco persistente",
         }
     )
 
@@ -565,148 +668,235 @@ async def action_read_galiciana_page(request: Request) -> JSONResponse:
     return JSONResponse(compact)
 
 
+@mcp.custom_route("/api/galiciana/investigaciones/crear", methods=["POST"], include_in_schema=False)
+async def action_create_investigation(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+        query = _query_from_payload(payload)
+        result = await get_default_engine().create_investigation(
+            query,
+            maximum_queries=max(1, min(int(payload.get("max_consultas", 8)), 10)),
+            maximum_results=max(1, min(int(payload.get("max_resultados", 80)), 150)),
+        )
+        return JSONResponse(result)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"},
+            status_code=502,
+        )
+
+
+@mcp.custom_route("/api/galiciana/investigaciones/procesar", methods=["POST"], include_in_schema=False)
+async def action_process_investigation(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+        investigation_id = str(payload.get("investigation_id") or "").strip()
+        if not investigation_id:
+            raise ValueError("Falta investigation_id.")
+        result = await get_default_engine().process(
+            investigation_id,
+            batch_size=max(1, min(int(payload.get("paginas_por_lote", 5)), 8)),
+            time_budget_seconds=max(10, min(int(payload.get("presupuesto_segundos", 40)), 55)),
+            read_adjacent=bool(payload.get("leer_adyacentes", True)),
+        )
+        return JSONResponse(result)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"},
+            status_code=502,
+        )
+
+
+@mcp.custom_route("/api/galiciana/investigaciones/informe", methods=["POST"], include_in_schema=False)
+async def action_investigation_report(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+        investigation_id = str(payload.get("investigation_id") or "").strip()
+        if not investigation_id:
+            raise ValueError("Falta investigation_id.")
+        result = get_default_engine().report(
+            investigation_id,
+            maximum_results=max(1, min(int(payload.get("max_resultados", 20)), 40)),
+            offset=max(0, int(payload.get("desde", 0))),
+            include_unread=bool(payload.get("incluir_no_leidas", True)),
+        )
+        return JSONResponse(result)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"},
+            status_code=500,
+        )
+
+
+@mcp.custom_route("/api/galiciana/investigaciones/familia", methods=["POST"], include_in_schema=False)
+async def action_family_investigation(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+        parent_id = str(payload.get("investigation_id_origen") or "").strip()
+        relative_name = str(payload.get("nombre_familiar") or "").strip()
+        if not parent_id or not relative_name:
+            raise ValueError("Faltan investigation_id_origen o nombre_familiar.")
+        result = await get_default_engine().create_family_investigation(
+            parent_id,
+            relative_name,
+            maximum_results=max(1, min(int(payload.get("max_resultados", 40)), 80)),
+        )
+        return JSONResponse(result)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"},
+            status_code=502,
+        )
+
+
 def _openapi_schema() -> dict[str, Any]:
     person_request = {
         "type": "object",
         "required": ["nombre"],
         "properties": {
-            "nombre": {
-                "type": "string",
-                "description": "Nombre completo principal de la persona.",
-            },
+            "nombre": {"type": "string", "description": "Nombre completo principal."},
             "variantes": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Variantes ortográficas, sin tildes o con apellidos invertidos.",
                 "default": [],
+                "description": "Formas sin tildes, invertidas y grafías documentadas o plausibles.",
             },
             "lugares": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Lugares útiles para separar homónimos.",
                 "default": [],
+                "description": "Lugares usados para distinguir homónimos, no como hechos descubiertos.",
             },
-            "fecha_desde": {
-                "type": "integer",
-                "minimum": 1500,
-                "maximum": 2100,
-                "description": "Primer año que debe admitirse.",
-            },
-            "fecha_hasta": {
-                "type": "integer",
-                "minimum": 1500,
-                "maximum": 2100,
-                "description": "Último año que debe admitirse.",
-            },
+            "fecha_desde": {"type": "integer", "minimum": 1500, "maximum": 2100},
+            "fecha_hasta": {"type": "integer", "minimum": 1500, "maximum": 2100},
             "conyuge": {"type": "string", "default": ""},
             "profesion": {"type": "string", "default": ""},
-            "max_consultas": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 10,
-                "default": 6,
-            },
-            "max_resultados": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 80,
-                "default": 40,
-            },
+            "max_consultas": {"type": "integer", "minimum": 1, "maximum": 10, "default": 8},
+            "max_resultados": {"type": "integer", "minimum": 1, "maximum": 150, "default": 80},
         },
         "additionalProperties": False,
     }
-
+    process_request = {
+        "type": "object",
+        "required": ["investigation_id"],
+        "properties": {
+            "investigation_id": {"type": "string"},
+            "paginas_por_lote": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5},
+            "presupuesto_segundos": {"type": "integer", "minimum": 10, "maximum": 55, "default": 40},
+            "leer_adyacentes": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    }
+    report_request = {
+        "type": "object",
+        "required": ["investigation_id"],
+        "properties": {
+            "investigation_id": {"type": "string"},
+            "desde": {"type": "integer", "minimum": 0, "default": 0},
+            "max_resultados": {"type": "integer", "minimum": 1, "maximum": 40, "default": 20},
+            "incluir_no_leidas": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    }
+    family_request = {
+        "type": "object",
+        "required": ["investigation_id_origen", "nombre_familiar"],
+        "properties": {
+            "investigation_id_origen": {"type": "string"},
+            "nombre_familiar": {"type": "string"},
+            "max_resultados": {"type": "integer", "minimum": 1, "maximum": 80, "default": 40},
+        },
+        "additionalProperties": False,
+    }
     page_request = {
         "type": "object",
         "required": ["url_pagina"],
         "properties": {
-            "url_pagina": {
-                "type": "string",
-                "format": "uri",
-                "description": "URL de una página devuelta por investigarPersonaGaliciana.",
-            },
-            "terminos": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Nombre y variantes que deben localizarse dentro del OCR completo.",
-                "default": [],
-            },
-            "max_caracteres": {
-                "type": "integer",
-                "minimum": 1500,
-                "maximum": 30000,
-                "default": 12000,
-            },
+            "url_pagina": {"type": "string", "format": "uri"},
+            "terminos": {"type": "array", "items": {"type": "string"}, "default": []},
+            "max_caracteres": {"type": "integer", "minimum": 1500, "maximum": 30000, "default": 12000},
         },
         "additionalProperties": False,
     }
 
+    def operation(operation_id: str, summary: str, description: str, schema: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "post": {
+                "operationId": operation_id,
+                "summary": summary,
+                "description": description,
+                "x-openai-isConsequential": False,
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {"schema": schema}},
+                },
+                "responses": {
+                    "200": {
+                        "description": "Operación completada.",
+                        "content": {"application/json": {"schema": {"type": "object", "additionalProperties": True}}},
+                    },
+                    "422": {"description": "Datos incompletos o investigación caducada."},
+                    "502": {"description": "La fuente remota no respondió correctamente."},
+                },
+            }
+        }
+
     return {
         "openapi": "3.1.0",
         "info": {
-            "title": "Rob — Investigador Genealógico",
+            "title": "Rob — Genealogista de Galiciana",
             "description": (
-                "Busca personas en el OCR de Galiciana y permite leer el ALTO XML "
-                "completo de las páginas encontradas."
+                "Investigaciones reanudables: búsqueda OCR, lectura ALTO por lotes, "
+                "caché, contexto geométrico, páginas contiguas y familia explícita."
             ),
-            "version": "0.6.1",
+            "version": "0.7.0",
         },
         "servers": [{"url": PUBLIC_BASE_URL}],
         "paths": {
-            "/api/galiciana/investigar": {
-                "post": {
-                    "operationId": "investigarPersonaGaliciana",
-                    "summary": "Buscar una persona dentro del OCR de Galiciana",
-                    "description": (
-                        "Genera consultas nominales, elimina páginas duplicadas y devuelve "
-                        "fragmentos, fechas, publicaciones, páginas y enlaces originales."
-                    ),
-                    "x-openai-isConsequential": False,
-                    "requestBody": {
-                        "required": True,
-                        "content": {"application/json": {"schema": person_request}},
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Resultados documentales localizados.",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"type": "object", "additionalProperties": True}
-                                }
-                            },
-                        },
-                        "422": {"description": "Datos de entrada incompletos."},
-                        "502": {"description": "La fuente remota no respondió correctamente."},
-                    },
-                }
-            },
-            "/api/galiciana/leer-pagina": {
-                "post": {
-                    "operationId": "leerPaginaGaliciana",
-                    "summary": "Leer el OCR completo de una página concreta de Galiciana",
-                    "description": (
-                        "Recupera el ALTO XML asociado a una página encontrada y extrae "
-                        "contextos alrededor del nombre solicitado."
-                    ),
-                    "x-openai-isConsequential": False,
-                    "requestBody": {
-                        "required": True,
-                        "content": {"application/json": {"schema": page_request}},
-                    },
-                    "responses": {
-                        "200": {
-                            "description": "Texto o contextos de la página.",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"type": "object", "additionalProperties": True}
-                                }
-                            },
-                        },
-                        "422": {"description": "Falta la URL de página."},
-                        "502": {"description": "La página remota no pudo leerse."},
-                    },
-                }
-            },
+            "/api/galiciana/investigaciones/crear": operation(
+                "crearInvestigacionGaliciana",
+                "Crear una investigación reanudable en Galiciana",
+                "Busca variantes, deduplica resultados y devuelve un investigation_id.",
+                person_request,
+            ),
+            "/api/galiciana/investigaciones/procesar": operation(
+                "procesarInvestigacionGaliciana",
+                "Leer el siguiente lote de páginas completas",
+                "Usa una sesión compartida, ALTO directo, caché, reintentos y lectura selectiva de páginas contiguas.",
+                process_request,
+            ),
+            "/api/galiciana/investigaciones/informe": operation(
+                "obtenerInformeGaliciana",
+                "Obtener el expediente documental",
+                "Devuelve cobertura, contextos ALTO, fuentes, errores y relaciones familiares explícitas.",
+                report_request,
+            ),
+            "/api/galiciana/investigaciones/familia": operation(
+                "crearInvestigacionFamiliarGaliciana",
+                "Investigar un familiar ya documentado",
+                "Solo abre la búsqueda si el parentesco fue extraído explícitamente de una página leída.",
+                family_request,
+            ),
+            "/api/galiciana/leer-pagina": operation(
+                "leerPaginaGaliciana",
+                "Leer manualmente una página concreta",
+                "Operación auxiliar para una URL individual de Galiciana.",
+                page_request,
+            ),
+            "/api/galiciana/investigar": operation(
+                "investigarPersonaGaliciana",
+                "Búsqueda OCR rápida sin expediente",
+                "Compatibilidad con la acción anterior; para investigaciones exhaustivas usa crearInvestigacionGaliciana.",
+                person_request,
+            ),
         },
     }
 
