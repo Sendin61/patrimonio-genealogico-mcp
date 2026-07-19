@@ -106,6 +106,29 @@ def test_family_extraction_is_explicit() -> None:
     )
 
 
+def test_sqlite_is_the_default_storage_backend(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    store = InvestigationStore(str(tmp_path / "local.sqlite3"))
+    assert store.storage_status() == {
+        "backend": "sqlite",
+        "persistent": False,
+        "configured_by": "ROB_DB_PATH",
+    }
+    assert store._sql("SELECT * FROM mentions WHERE investigation_id=?") == (
+        "SELECT * FROM mentions WHERE investigation_id=?"
+    )
+
+
+def test_postgresql_dialect_conversion_without_exposing_url() -> None:
+    store = object.__new__(InvestigationStore)
+    store.backend = "postgresql"
+    store.database_url = "postgresql://secret-value"
+    assert store._sql("SELECT * FROM mentions WHERE investigation_id=? LIMIT ?") == (
+        "SELECT * FROM mentions WHERE investigation_id=%s LIMIT %s"
+    )
+    assert "secret-value" not in str(store.storage_status())
+
+
 @pytest.mark.asyncio
 async def test_resumable_batch_reads_direct_alto_and_uses_cache(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("rob.galiciana_investigations.GalicianaOCRConnector", FakeConnector)

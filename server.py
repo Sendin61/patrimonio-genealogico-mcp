@@ -188,12 +188,14 @@ def _query_from_payload(payload: dict[str, Any]) -> GenealogyQuery:
 @mcp.tool()
 def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
+    storage = get_default_engine().store.storage_status()
     return {
         "servidor": "Rob — Metabuscador Genealógico",
         "version": "0.7.0",
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "actions_configuradas": True,
+        "almacenamiento": storage,
         "nota": "development no significa verificado; la prueba real se hace contra cada portal.",
     }
 
@@ -550,6 +552,7 @@ async def abrir_registro_europeana(record_id: str) -> dict[str, Any]:
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health_route(request: Request) -> JSONResponse:
     del request
+    storage = get_default_engine().store.storage_status()
     return JSONResponse(
         {
             "ok": True,
@@ -558,7 +561,7 @@ async def health_route(request: Request) -> JSONResponse:
             "mcp": f"{PUBLIC_BASE_URL}/mcp",
             "openapi": f"{PUBLIC_BASE_URL}/openapi.json",
             "motor_expedientes": True,
-            "persistencia": "SQLite; durable si ROB_DB_PATH apunta a un disco persistente",
+            "persistencia": storage,
         }
     )
 

@@ -18,6 +18,13 @@ from xml.etree import ElementTree as ET
 
 import httpx
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # SQLite-only local installs remain usable.
+    psycopg = None
+    dict_row = None
+
 from .connectors.galiciana_ocr import (
     BASE_URL,
     DEFAULT_HEADERS,
@@ -118,21 +125,32 @@ def _safe_name(value: str) -> str:
 
 
 class InvestigationStore:
-    """Small SQLite dossier used to make long Galiciana work resumable.
+    """Persistent dossier backed by PostgreSQL, with SQLite as a local fallback."""
 
-    Render's free local filesystem can be reset on redeploy or restart. The
-    database still prevents repetition during a live investigation and becomes
-    durable automatically when ROB_DB_PATH points to a persistent disk.
-    """
-
-    def __init__(self, path: str = DEFAULT_DB_PATH) -> None:
+    def __init__(self, path: str = DEFAULT_DB_PATH, database_url: str | None = None) -> None:
         self.path = path or DEFAULT_DB_PATH
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self.database_url = (
+            os.getenv("DATABASE_URL", "").strip() if database_url is None else database_url.strip()
+        )
+        self.backend = "postgresql" if self.database_url else "sqlite"
+        if self.backend == "sqlite":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        elif psycopg is None:
+            raise RuntimeError("DATABASE_URL está definida, pero psycopg no está instalado.")
         self._lock = threading.RLock()
         self._initialise()
         self.prune(DEFAULT_TTL_DAYS)
 
-    def _connect(self) -> sqlite3.Connection:
+    def storage_status(self) -> dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "persistent": self.backend == "postgresql",
+            "configured_by": "DATABASE_URL" if self.backend == "postgresql" else "ROB_DB_PATH",
+        }
+
+    def _connect(self) -> Any:
+        if self.backend == "postgresql":
+            return psycopg.connect(self.database_url, row_factory=dict_row)
         connection = sqlite3.connect(self.path, timeout=20)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
@@ -140,7 +158,7 @@ class InvestigationStore:
         return connection
 
     def _initialise(self) -> None:
-        schema = """
+        common_schema = """
         CREATE TABLE IF NOT EXISTS investigations (
             id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL,
@@ -206,8 +224,10 @@ class InvestigationStore:
             updated_at TEXT NOT NULL
         );
 
+        """
+        relations_schema = """
         CREATE TABLE IF NOT EXISTS relations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {relation_id},
             investigation_id TEXT NOT NULL,
             mention_key TEXT NOT NULL,
             subject_name TEXT NOT NULL,
@@ -219,14 +239,38 @@ class InvestigationStore:
             UNIQUE(investigation_id, mention_key, relation_type, relative_name, evidence),
             FOREIGN KEY (investigation_id) REFERENCES investigations(id) ON DELETE CASCADE
         );
+        CREATE INDEX IF NOT EXISTS idx_relations_investigation
+            ON relations(investigation_id, relation_type, relative_name);
         """
         with self._lock, self._connect() as connection:
-            connection.executescript(schema)
+            if self.backend == "sqlite":
+                connection.executescript(
+                    common_schema + relations_schema.format(
+                        relation_id="INTEGER PRIMARY KEY AUTOINCREMENT"
+                    )
+                )
+            else:
+                for statement in (common_schema + relations_schema.format(
+                    relation_id="BIGSERIAL PRIMARY KEY"
+                )).split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+
+    def _sql(self, statement: str) -> str:
+        if self.backend == "sqlite":
+            return statement
+        return statement.replace("?", "%s")
+
+    def _execute(self, connection: Any, statement: str, params: tuple[Any, ...] = ()) -> Any:
+        return connection.execute(self._sql(statement), params)
+
+    def _executemany(self, connection: Any, statement: str, params: Any) -> Any:
+        return connection.executemany(self._sql(statement), params)
 
     def prune(self, ttl_days: int) -> None:
         threshold = time.time() - ttl_days * 86400
         with self._lock, self._connect() as connection:
-            rows = connection.execute("SELECT id, updated_at FROM investigations").fetchall()
+            rows = self._execute(connection, "SELECT id, updated_at FROM investigations").fetchall()
             stale: list[str] = []
             for row in rows:
                 try:
@@ -235,13 +279,13 @@ class InvestigationStore:
                     continue
                 if stamp < threshold:
                     stale.append(row["id"])
-            connection.executemany("DELETE FROM investigations WHERE id=?", [(item,) for item in stale])
+            self._executemany(connection, "DELETE FROM investigations WHERE id=?", [(item,) for item in stale])
 
     def create(self, query: GenealogyQuery, report: Any) -> str:
         investigation_id = uuid.uuid4().hex
         now = _utc_now()
         with self._lock, self._connect() as connection:
-            connection.execute(
+            self._execute(connection,
                 """
                 INSERT INTO investigations(
                     id, created_at, updated_at, status, query_json, queries_json,
@@ -263,7 +307,7 @@ class InvestigationStore:
             )
             for ordinal, mention in enumerate(report.mentions):
                 categories = [item.category for item in mention.interpretations]
-                connection.execute(
+                self._execute(connection,
                     """
                     INSERT INTO mentions(
                         investigation_id, mention_key, ordinal, record_id, title,
@@ -297,7 +341,7 @@ class InvestigationStore:
 
     def investigation(self, investigation_id: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as connection:
-            row = connection.execute(
+            row = self._execute(connection,
                 "SELECT * FROM investigations WHERE id=?", (investigation_id,)
             ).fetchone()
             return dict(row) if row else None
@@ -311,27 +355,41 @@ class InvestigationStore:
     def reset_reading(self, investigation_id: str) -> None:
         """Recover pages left in reading state by an interrupted Action call."""
         with self._lock, self._connect() as connection:
-            connection.execute(
-                "UPDATE mentions SET status='retryable' WHERE investigation_id=? AND status='reading'",
-                (investigation_id,),
+            self._execute(
+                connection,
+                """UPDATE mentions SET status='retryable'
+                   WHERE investigation_id=? AND status='reading'
+                     AND (processed_at IS NULL OR processed_at < ?)""",
+                (investigation_id, datetime.fromtimestamp(time.time() - 600, timezone.utc).isoformat()),
             )
 
     def pending(self, investigation_id: str, limit: int) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                """
+            statement = """
                 SELECT * FROM mentions
                 WHERE investigation_id=? AND status IN ('pending','retryable')
                 ORDER BY score DESC, COALESCE(path,''), COALESCE(page_number,9999), ordinal
                 LIMIT ?
-                """,
+                """
+            if self.backend == "postgresql":
+                statement += " FOR UPDATE SKIP LOCKED"
+            rows = self._execute(connection, statement,
                 (investigation_id, max(1, limit)),
             ).fetchall()
-            return [dict(row) for row in rows]
+            claimed = [dict(row) for row in rows]
+            for row in claimed:
+                self._execute(
+                    connection,
+                    """UPDATE mentions SET status='reading', attempts=attempts+1,
+                              error=NULL, processed_at=?
+                       WHERE investigation_id=? AND mention_key=?""",
+                    (_utc_now(), investigation_id, row["mention_key"]),
+                )
+            return claimed
 
     def mark_reading(self, investigation_id: str, mention_key: str) -> None:
         with self._lock, self._connect() as connection:
-            connection.execute(
+            self._execute(connection,
                 """
                 UPDATE mentions SET status='reading', attempts=attempts+1, error=NULL
                 WHERE investigation_id=? AND mention_key=?
@@ -357,7 +415,7 @@ class InvestigationStore:
         error: str | None = None,
     ) -> None:
         with self._lock, self._connect() as connection:
-            connection.execute(
+            self._execute(connection,
                 """
                 UPDATE mentions SET
                     status=?, ocr_url=?, image_url=?, full_text=?, context_text=?,
@@ -385,7 +443,7 @@ class InvestigationStore:
             self._refresh_status(connection, investigation_id)
 
     def _refresh_status(self, connection: sqlite3.Connection, investigation_id: str) -> None:
-        counts = connection.execute(
+        counts = self._execute(connection,
             """
             SELECT
                 SUM(CASE WHEN status='read' THEN 1 ELSE 0 END) AS read_count,
@@ -397,7 +455,7 @@ class InvestigationStore:
             (investigation_id,),
         ).fetchone()
         status = "complete" if int(counts["open_count"] or 0) == 0 else "processing"
-        connection.execute(
+        self._execute(connection,
             "UPDATE investigations SET status=?, updated_at=? WHERE id=?",
             (status, _utc_now(), investigation_id),
         )
@@ -405,7 +463,7 @@ class InvestigationStore:
     def cache_get(self, path: str, page_number: int) -> dict[str, Any] | None:
         key = f"{path}:{page_number}"
         with self._lock, self._connect() as connection:
-            row = connection.execute("SELECT * FROM page_cache WHERE cache_key=?", (key,)).fetchone()
+            row = self._execute(connection, "SELECT * FROM page_cache WHERE cache_key=?", (key,)).fetchone()
             return dict(row) if row else None
 
     def cache_put(
@@ -420,7 +478,7 @@ class InvestigationStore:
     ) -> None:
         key = f"{path}:{page_number}"
         with self._lock, self._connect() as connection:
-            connection.execute(
+            self._execute(connection,
                 """
                 INSERT INTO page_cache(cache_key,path,page_number,ocr_url,image_url,full_text,layout_json,updated_at)
                 VALUES(?,?,?,?,?,?,?,?)
@@ -445,13 +503,16 @@ class InvestigationStore:
         with self._lock, self._connect() as connection:
             for relation in relations:
                 try:
-                    connection.execute(
-                        """
-                        INSERT OR IGNORE INTO relations(
+                    statement = """
+                        INSERT INTO relations(
                             investigation_id, mention_key, subject_name, relation_type,
                             relative_name, evidence, confidence, source_url
                         ) VALUES(?,?,?,?,?,?,?,?)
-                        """,
+                        ON CONFLICT(investigation_id, mention_key, relation_type, relative_name, evidence)
+                        DO NOTHING
+                        """
+                    self._execute(connection,
+                        statement,
                         (
                             investigation_id,
                             mention_key,
@@ -471,7 +532,7 @@ class InvestigationStore:
         if row is None:
             raise KeyError("La investigación no existe o ya caducó.")
         with self._lock, self._connect() as connection:
-            counts = connection.execute(
+            counts = self._execute(connection,
                 """
                 SELECT
                     COUNT(*) AS total,
@@ -505,7 +566,7 @@ class InvestigationStore:
         self, investigation_id: str, limit: int = 20, offset: int = 0
     ) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
+            rows = self._execute(connection,
                 """
                 SELECT * FROM mentions WHERE investigation_id=?
                 ORDER BY COALESCE(document_date,'9999'), ordinal LIMIT ? OFFSET ?
@@ -516,12 +577,20 @@ class InvestigationStore:
 
     def relations(self, investigation_id: str) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                """
+            evidence_aggregate = (
+                "STRING_AGG(evidence, ' || ')" if self.backend == "postgresql"
+                else "GROUP_CONCAT(evidence, ' || ')"
+            )
+            sources_aggregate = (
+                "STRING_AGG(source_url, ' || ')" if self.backend == "postgresql"
+                else "GROUP_CONCAT(source_url, ' || ')"
+            )
+            rows = self._execute(connection,
+                f"""
                 SELECT relation_type, relative_name, MAX(confidence) AS confidence,
                        COUNT(*) AS evidence_count,
-                       GROUP_CONCAT(evidence, ' || ') AS evidence,
-                       GROUP_CONCAT(source_url, ' || ') AS source_urls
+                       {evidence_aggregate} AS evidence,
+                       {sources_aggregate} AS source_urls
                 FROM relations WHERE investigation_id=?
                 GROUP BY relation_type, relative_name
                 ORDER BY confidence DESC, evidence_count DESC, relative_name
@@ -715,7 +784,6 @@ class GalicianaInvestigationEngine:
                     break
                 processed += 1
                 key = mention["mention_key"]
-                self.store.mark_reading(investigation_id, key)
                 path = str(mention.get("path") or "")
                 page_number = mention.get("page_number")
                 if not path or not page_number:
