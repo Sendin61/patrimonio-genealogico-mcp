@@ -39,7 +39,14 @@ from .models import GenealogyQuery
 
 
 DEFAULT_DB_PATH = os.getenv("ROB_DB_PATH", "/tmp/rob_galiciana.sqlite3").strip()
-DEFAULT_TTL_DAYS = max(1, int(os.getenv("ROB_INVESTIGATION_TTL_DAYS", "14")))
+DEFAULT_TTL_DAYS = 0
+
+
+def _configured_ttl_days() -> int:
+    try:
+        return max(0, int(os.getenv("ROB_INVESTIGATION_TTL_DAYS", str(DEFAULT_TTL_DAYS))))
+    except ValueError:
+        return DEFAULT_TTL_DAYS
 
 
 def _utc_now() -> str:
@@ -127,7 +134,12 @@ def _safe_name(value: str) -> str:
 class InvestigationStore:
     """Persistent dossier backed by PostgreSQL, with SQLite as a local fallback."""
 
-    def __init__(self, path: str = DEFAULT_DB_PATH, database_url: str | None = None) -> None:
+    def __init__(
+        self,
+        path: str = DEFAULT_DB_PATH,
+        database_url: str | None = None,
+        ttl_days: int | None = None,
+    ) -> None:
         self.path = path or DEFAULT_DB_PATH
         self.database_url = (
             os.getenv("DATABASE_URL", "").strip() if database_url is None else database_url.strip()
@@ -139,7 +151,9 @@ class InvestigationStore:
             raise RuntimeError("DATABASE_URL está definida, pero psycopg no está instalado.")
         self._lock = threading.RLock()
         self._initialise()
-        self.prune(DEFAULT_TTL_DAYS)
+        self.ttl_days = _configured_ttl_days() if ttl_days is None else max(0, ttl_days)
+        if self.ttl_days:
+            self.prune(self.ttl_days)
 
     def storage_status(self) -> dict[str, Any]:
         return {
@@ -268,6 +282,8 @@ class InvestigationStore:
         return connection.executemany(self._sql(statement), params)
 
     def prune(self, ttl_days: int) -> None:
+        if ttl_days <= 0:
+            return
         threshold = time.time() - ttl_days * 86400
         with self._lock, self._connect() as connection:
             rows = self._execute(connection, "SELECT id, updated_at FROM investigations").fetchall()
@@ -365,27 +381,42 @@ class InvestigationStore:
 
     def pending(self, investigation_id: str, limit: int) -> list[dict[str, Any]]:
         with self._lock, self._connect() as connection:
+            rows = self._execute(
+                connection,
+                """
+                    SELECT * FROM mentions
+                    WHERE investigation_id=? AND status IN ('pending','retryable')
+                    ORDER BY score DESC, COALESCE(path,''), COALESCE(page_number,9999), ordinal
+                    LIMIT ?
+                """,
+                (investigation_id, max(1, limit)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def claim_pending(self, investigation_id: str) -> dict[str, Any] | None:
+        """Atomically claim one page, avoiding abandoned unprocessed batches."""
+        with self._lock, self._connect() as connection:
             statement = """
                 SELECT * FROM mentions
                 WHERE investigation_id=? AND status IN ('pending','retryable')
                 ORDER BY score DESC, COALESCE(path,''), COALESCE(page_number,9999), ordinal
-                LIMIT ?
-                """
+                LIMIT 1
+            """
             if self.backend == "postgresql":
                 statement += " FOR UPDATE SKIP LOCKED"
-            rows = self._execute(connection, statement,
-                (investigation_id, max(1, limit)),
-            ).fetchall()
-            claimed = [dict(row) for row in rows]
-            for row in claimed:
-                self._execute(
-                    connection,
-                    """UPDATE mentions SET status='reading', attempts=attempts+1,
-                              error=NULL, processed_at=?
-                       WHERE investigation_id=? AND mention_key=?""",
-                    (_utc_now(), investigation_id, row["mention_key"]),
-                )
-            return claimed
+            row = self._execute(connection, statement, (investigation_id,)).fetchone()
+            if row is None:
+                return None
+            claimed = dict(row)
+            cursor = self._execute(
+                connection,
+                """UPDATE mentions SET status='reading', attempts=attempts+1,
+                          error=NULL, processed_at=?
+                   WHERE investigation_id=? AND mention_key=?
+                     AND status IN ('pending','retryable')""",
+                (_utc_now(), investigation_id, claimed["mention_key"]),
+            )
+            return claimed if cursor.rowcount == 1 else None
 
     def mark_reading(self, investigation_id: str, mention_key: str) -> None:
         with self._lock, self._connect() as connection:
@@ -764,12 +795,6 @@ class GalicianaInvestigationEngine:
     ) -> dict[str, Any]:
         query = self.store.query(investigation_id)
         self.store.reset_reading(investigation_id)
-        pending = self.store.pending(investigation_id, max(1, min(batch_size, 8)))
-        if not pending:
-            summary = self.store.summary(investigation_id)
-            summary.update({"procesadas_en_esta_llamada": 0, "completada": True})
-            return summary
-
         started = time.monotonic()
         processed = 0
         succeeded = 0
@@ -779,8 +804,11 @@ class GalicianaInvestigationEngine:
 
         async with self._client() as client:
             await self._seed(client)
-            for mention in pending:
+            for _ in range(max(1, min(batch_size, 8))):
                 if processed and time.monotonic() - started >= max(10, time_budget_seconds):
+                    break
+                mention = self.store.claim_pending(investigation_id)
+                if mention is None:
                     break
                 processed += 1
                 key = mention["mention_key"]
