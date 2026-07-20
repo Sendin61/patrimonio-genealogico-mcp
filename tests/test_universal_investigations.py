@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import sqlite3
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from rob.investigations.engine import UniversalInvestigationEngine
+from rob.investigations.models import InvestigationTarget, SourceCapabilities
+from rob.investigations.sources import GalicianaSourceAdapter
+from rob.investigations.store import UniversalInvestigationStore
+
+
+class FakeSourceAdapter:
+    capabilities = SourceCapabilities()
+    available = True
+
+    def __init__(
+        self,
+        source_name: str = "galiciana",
+        *,
+        fail_create: bool = False,
+        fail_process: bool = False,
+        complete_on_create: bool = False,
+    ) -> None:
+        self.source_name = source_name
+        self.fail_create = fail_create
+        self.fail_process = fail_process
+        self.complete_on_create = complete_on_create
+        self.created = 0
+        self.processed = 0
+
+    async def create_investigation(self, target, **kwargs) -> dict[str, Any]:
+        del target, kwargs
+        self.created += 1
+        if self.fail_create:
+            raise RuntimeError(f"{self.source_name} no disponible")
+        return {
+            "source_investigation_id": f"{self.source_name}-child-{self.created}",
+            "status": "complete" if self.complete_on_create else "processing",
+        }
+
+    async def process_next_batch(self, source_investigation_id, **kwargs):
+        del source_investigation_id, kwargs
+        self.processed += 1
+        if self.fail_process:
+            raise RuntimeError(f"{self.source_name} falló al procesar")
+        return {
+            "status": "complete",
+            "complete": True,
+            "detail": {"procesadas_en_esta_llamada": 1},
+        }
+
+    def get_report(self, source_investigation_id, **kwargs):
+        del kwargs
+        return {
+            "estado": "complete",
+            "cobertura": 1.0,
+            "total_resultados": 1,
+            "paginas_leidas": 1,
+            "paginas_pendientes": 0,
+            "paginas_fallidas": 0,
+            "evidencias_documentales": [
+                {
+                    "fecha": "1911-08-25",
+                    "titulo": "Noticiero de Vigo",
+                    "url_pagina": "https://example.invalid/page",
+                    "contexto": "OCR literal",
+                }
+            ],
+            "paginas_no_leidas": [],
+            "familia_documentada_o_candidata": [
+                {"relation_type": "cónyuge", "relative_name": "Raquel"}
+            ],
+            "source_investigation_id": source_investigation_id,
+        }
+
+    async def read_source(self, source_url, **kwargs):
+        del kwargs
+        return {"fuente": self.source_name, "source_url": source_url, "content": "OCR"}
+
+
+def make_engine(tmp_path, *adapters):
+    store = UniversalInvestigationStore(str(tmp_path / "universal.sqlite3"))
+    return UniversalInvestigationEngine(store, adapters), store
+
+
+@pytest.mark.asyncio
+async def test_create_persist_and_recover_universal_and_child_ids(tmp_path) -> None:
+    adapter = FakeSourceAdapter()
+    engine, store = make_engine(tmp_path, adapter)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Andrés Fernández Táboas"),
+        requested_sources=["galiciana", "galiciana"],
+    )
+
+    universal_id = created["investigation_id"]
+    child_id = created["fuentes"][0]["investigation_id_fuente"]
+    assert universal_id != child_id
+    assert created["fuentes_solicitadas"] == ["galiciana"]
+    assert adapter.created == 1
+
+    recovered = UniversalInvestigationStore(str(tmp_path / "universal.sqlite3"))
+    assert recovered.require(universal_id)["target"].name == "Andrés Fernández Táboas"
+    runs = recovered.source_runs(universal_id)
+    assert len(runs) == 1
+    assert runs[0]["source_investigation_id"] == child_id
+    assert recovered.ensure_source_run(universal_id, "galiciana")["id"] == runs[0]["id"]
+
+    with sqlite3.connect(tmp_path / "universal.sqlite3") as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+    assert {"universal_investigations", "universal_source_runs"} <= tables
+
+
+@pytest.mark.asyncio
+async def test_process_and_aggregate_source_report(tmp_path) -> None:
+    adapter = FakeSourceAdapter()
+    engine, _ = make_engine(tmp_path, adapter)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Andrés Fernández Táboas")
+    )
+    universal_id = created["investigation_id"]
+
+    processed = await engine.process(universal_id, batch_size=3, time_budget_seconds=55)
+    assert processed["estado"] == "complete"
+    assert processed["completada"] is True
+    assert adapter.processed == 1
+
+    report = engine.report(universal_id)
+    evidence = report["evidencias_documentales"][0]
+    assert evidence["fuente"] == "galiciana"
+    assert evidence["investigation_id_fuente"].startswith("galiciana-child-")
+    assert evidence["contexto"] == "OCR literal"
+    assert report["relaciones_familiares_documentadas"][0]["fuente"] == "galiciana"
+    assert report["cobertura_por_fuente"][0]["cobertura"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_unknown_source_is_rejected_before_persistence(tmp_path) -> None:
+    engine, store = make_engine(tmp_path, FakeSourceAdapter())
+    with pytest.raises(ValueError, match="Fuente desconocida"):
+        await engine.create_investigation(
+            InvestigationTarget(name="Persona"), requested_sources=["exa"]
+        )
+    with sqlite3.connect(tmp_path / "universal.sqlite3") as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM universal_investigations"
+        ).fetchone()[0]
+    assert count == 0
+    assert store.source_runs("missing") == []
+
+
+@pytest.mark.asyncio
+async def test_source_creation_failure_preserves_dossier(tmp_path) -> None:
+    failing = FakeSourceAdapter("fallida", fail_create=True)
+    engine, store = make_engine(tmp_path, failing)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"),
+        requested_sources=["fallida"],
+    )
+
+    assert created["estado"] == "failed"
+    assert store.require(created["investigation_id"])["status"] == "failed"
+    runs = {run["source_name"]: run for run in store.source_runs(created["investigation_id"])}
+    assert runs["fallida"]["status"] == "failed"
+    assert "no disponible" in runs["fallida"]["diagnostics"][0]["mensaje"]
+
+
+@pytest.mark.asyncio
+async def test_partial_when_one_source_completes_and_another_fails(tmp_path) -> None:
+    complete = FakeSourceAdapter("documentada")
+    failing = FakeSourceAdapter("fallida", fail_process=True)
+    engine, store = make_engine(tmp_path, complete, failing)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"),
+        requested_sources=["documentada", "fallida"],
+    )
+    processed = await engine.process(created["investigation_id"])
+
+    assert processed["estado"] == "partial"
+    assert store.require(created["investigation_id"])["status"] == "partial"
+    runs = {run["source_name"]: run for run in store.source_runs(created["investigation_id"])}
+    assert runs["documentada"]["status"] == "complete"
+    assert runs["fallida"]["status"] == "failed"
+    assert "falló al procesar" in runs["fallida"]["diagnostics"][0]["mensaje"]
+
+
+@pytest.mark.asyncio
+async def test_galiciana_adapter_delegates_without_reimplementing_source(tmp_path) -> None:
+    class FakeGalicianaEngine:
+        timeout = 12
+        transport = None
+        store = SimpleNamespace(investigation=lambda investigation_id: {"diagnostics_json": "[]"})
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def create_investigation(self, query, **kwargs):
+            self.calls.append(("create", query.name, kwargs))
+            return {"investigation_id": "gal-child", "estado": "pending"}
+
+        async def process(self, investigation_id, **kwargs):
+            self.calls.append(("process", investigation_id, kwargs))
+            return {"completada": True}
+
+        def report(self, investigation_id, **kwargs):
+            self.calls.append(("report", investigation_id, kwargs))
+            return {"evidencias_documentales": []}
+
+    class FakeConnector:
+        async def read_page(self, url):
+            return {
+                "estado": "ok",
+                "url": url,
+                "texto_ocr": "Andrés aparece en el OCR",
+                "ocr_url": "https://example.invalid/alto",
+                "imagen_pagina": "https://example.invalid/image",
+            }
+
+    galiciana = FakeGalicianaEngine()
+    adapter = GalicianaSourceAdapter(galiciana, connector=FakeConnector())
+    created = await adapter.create_investigation(
+        InvestigationTarget(name="Andrés"), maximum_queries=4, maximum_results=10
+    )
+    processed = await adapter.process_next_batch(
+        "gal-child", batch_size=2, time_budget_seconds=20
+    )
+    report = adapter.get_report(
+        "gal-child", offset=0, maximum_results=10, include_pending=True
+    )
+    read = await adapter.read_source(
+        "https://example.invalid/page", terms=["Andrés"], maximum_characters=100
+    )
+
+    assert created["source_investigation_id"] == "gal-child"
+    assert processed["status"] == "complete"
+    assert report == {"evidencias_documentales": [], "diagnosticos_fuente": []}
+    assert read["contextos"] == ["Andrés aparece en el OCR"]
+    assert read["documento"]["url_imagen"].endswith("/image")
+    assert [call[0] for call in galiciana.calls] == ["create", "process", "report"]

@@ -22,6 +22,8 @@ from rob.galiciana_investigations import (
     extract_family_relations,
 )
 from rob.models import GenealogyQuery
+from rob.investigations.models import InvestigationTarget
+from rob.investigations.store import UniversalInvestigationStore
 
 
 ALTO = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -226,6 +228,25 @@ def test_postgresql_adapter_schema_crud_cache_relations_and_persistence(tmp_path
     assert relations[0]["evidence_count"] == 1
     assert relations[0]["relative_name"] == "Raquel Valenzuela Martínez"
 
+    universal_first = UniversalInvestigationStore(database=first)
+    universal_id = universal_first.create(
+        InvestigationTarget(name="Andrés Fernández Táboas"), ["galiciana"]
+    )
+    run = universal_first.ensure_source_run(universal_id, "galiciana")
+    universal_first.update_run(
+        universal_id,
+        "galiciana",
+        status="processing",
+        source_investigation_id=investigation_id,
+    )
+    universal_second = UniversalInvestigationStore(database=second)
+    assert universal_second.require(universal_id)["target"].name == "Andrés Fernández Táboas"
+    assert universal_second.source_runs(universal_id)[0]["id"] == run["id"]
+    assert (
+        universal_second.source_runs(universal_id)[0]["source_investigation_id"]
+        == investigation_id
+    )
+
     with sqlite3.connect(adapter_path) as connection:
         objects = {
             row[0]
@@ -233,7 +254,14 @@ def test_postgresql_adapter_schema_crud_cache_relations_and_persistence(tmp_path
                 "SELECT name FROM sqlite_master WHERE type IN ('table','index')"
             )
         }
-    assert {"investigations", "mentions", "page_cache", "relations"} <= objects
+    assert {
+        "investigations",
+        "mentions",
+        "page_cache",
+        "relations",
+        "universal_investigations",
+        "universal_source_runs",
+    } <= objects
     assert {"idx_mentions_pending", "idx_mentions_path", "idx_relations_investigation"} <= objects
 
 

@@ -24,9 +24,16 @@ from rob.connectors.oai_pmh import (
 )
 from rob.models import GenealogyQuery
 from rob.galiciana_investigations import get_default_engine
+from rob.investigations import (
+    GalicianaSourceAdapter,
+    InvestigationTarget,
+    UniversalInvestigationEngine,
+    UniversalInvestigationStore,
+)
 from rob.query_expansion import expand_query
 from rob.registry import list_registered_sources
 from rob.sources import source_summary
+from rob.version import SERVICE_VERSION
 
 
 EUROPEANA_SEARCH_URL = "https://api.europeana.eu/record/v2/search.json"
@@ -250,13 +257,36 @@ def _query_from_payload(payload: dict[str, Any]) -> GenealogyQuery:
     )
 
 
+def _target_from_payload(payload: dict[str, Any]) -> InvestigationTarget:
+    query = _query_from_payload(payload)
+    return InvestigationTarget(
+        name=query.name,
+        variants=list(query.variants),
+        places=list(query.places),
+        year_from=query.year_from,
+        year_to=query.year_to,
+        spouse=query.spouse,
+        profession=query.profession,
+    )
+
+
+def get_universal_engine() -> UniversalInvestigationEngine:
+    """Build a stateless coordinator over the persisted, existing Galiciana engine."""
+    galiciana_engine = get_default_engine()
+    store = UniversalInvestigationStore(database=galiciana_engine.store)
+    return UniversalInvestigationEngine(
+        store,
+        [GalicianaSourceAdapter(galiciana_engine)],
+    )
+
+
 @mcp.tool()
 def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     storage = get_default_engine().store.storage_status()
     return {
         "servidor": "Rob — Metabuscador Genealógico",
-        "version": "0.7.0",
+        "version": SERVICE_VERSION,
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "actions_configuradas": True,
@@ -623,10 +653,11 @@ async def health_route(request: Request) -> JSONResponse:
         {
             "ok": True,
             "service": "Rob — Investigador Genealógico",
-            "version": "0.7.0",
+            "version": SERVICE_VERSION,
             "mcp": f"{PUBLIC_BASE_URL}/mcp",
             "openapi": f"{PUBLIC_BASE_URL}/openapi.json",
             "motor_expedientes": True,
+            "motor_universal": True,
             "persistencia": storage,
             "seguridad": _security_status(),
         }
@@ -827,6 +858,136 @@ async def action_family_investigation(request: Request) -> JSONResponse:
         )
 
 
+@mcp.custom_route("/api/investigacion/crear", methods=["POST"], include_in_schema=False)
+async def action_create_universal_investigation(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "El cuerpo debe ser JSON válido."}, status_code=400)
+    try:
+        sources = payload.get("fuentes", ["galiciana"])
+        if sources is None:
+            sources = ["galiciana"]
+        if not isinstance(sources, list):
+            raise ValueError("fuentes debe ser una lista.")
+        result = await get_universal_engine().create_investigation(
+            _target_from_payload(payload),
+            requested_sources=sources,
+            maximum_queries=max(1, min(int(payload.get("max_consultas", 8)), 10)),
+            maximum_results_per_source=max(
+                1,
+                min(int(payload.get("max_resultados_por_fuente", 80)), 150),
+            ),
+        )
+        return JSONResponse(result)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"},
+            status_code=502,
+        )
+
+
+@mcp.custom_route("/api/investigacion/procesar", methods=["POST"], include_in_schema=False)
+async def action_process_universal_investigation(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "El cuerpo debe ser JSON válido."}, status_code=400)
+    try:
+        investigation_id = str(payload.get("investigation_id") or "").strip()
+        if not investigation_id:
+            raise ValueError("Falta investigation_id.")
+        sources = payload.get("fuentes", [])
+        if not isinstance(sources, list):
+            raise ValueError("fuentes debe ser una lista.")
+        result = await get_universal_engine().process(
+            investigation_id,
+            batch_size=max(1, min(int(payload.get("elementos_por_lote", 5)), 20)),
+            time_budget_seconds=max(
+                1, min(int(payload.get("presupuesto_segundos", 50)), 55)
+            ),
+            sources=sources,
+        )
+        return JSONResponse(result)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"},
+            status_code=502,
+        )
+
+
+@mcp.custom_route("/api/investigacion/informe", methods=["POST"], include_in_schema=False)
+async def action_universal_investigation_report(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "El cuerpo debe ser JSON válido."}, status_code=400)
+    try:
+        investigation_id = str(payload.get("investigation_id") or "").strip()
+        if not investigation_id:
+            raise ValueError("Falta investigation_id.")
+        result = get_universal_engine().report(
+            investigation_id,
+            offset=max(0, int(payload.get("desde", 0))),
+            maximum_results=max(1, min(int(payload.get("max_resultados", 20)), 100)),
+            include_pending=bool(payload.get("incluir_pendientes", True)),
+        )
+        return JSONResponse(result)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"},
+            status_code=502,
+        )
+
+
+@mcp.custom_route("/api/investigacion/leer-fuente", methods=["POST"], include_in_schema=False)
+async def action_read_investigation_source(request: Request) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "El cuerpo debe ser JSON válido."}, status_code=400)
+    try:
+        source_name = str(payload.get("fuente") or "").strip()
+        source_url = str(payload.get("url") or "").strip()
+        if not source_name:
+            raise ValueError("Falta el campo obligatorio fuente.")
+        if not source_url:
+            raise ValueError("Falta el campo obligatorio url.")
+        terms = payload.get("terminos", [])
+        if not isinstance(terms, list):
+            raise ValueError("terminos debe ser una lista.")
+        result = await get_universal_engine().read_source(
+            source_name,
+            source_url,
+            terms=[str(value).strip() for value in terms if str(value).strip()],
+            maximum_characters=max(
+                1, min(int(payload.get("max_caracteres", 12000)), 30000)
+            ),
+        )
+        return JSONResponse(result)
+    except (ValueError, KeyError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=422)
+    except RuntimeError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"{type(exc).__name__}: {str(exc).strip() or repr(exc)}"},
+            status_code=502,
+        )
+
+
 def _openapi_schema() -> dict[str, Any]:
     person_request = {
         "type": "object",
@@ -896,6 +1057,65 @@ def _openapi_schema() -> dict[str, Any]:
         },
         "additionalProperties": False,
     }
+    universal_create_request = {
+        "type": "object",
+        "required": ["nombre"],
+        "properties": {
+            "nombre": {"type": "string"},
+            "variantes": {"type": "array", "items": {"type": "string"}, "default": []},
+            "lugares": {"type": "array", "items": {"type": "string"}, "default": []},
+            "fecha_desde": {"type": "integer", "minimum": 1500, "maximum": 2100},
+            "fecha_hasta": {"type": "integer", "minimum": 1500, "maximum": 2100},
+            "conyuge": {"type": "string", "default": ""},
+            "profesion": {"type": "string", "default": ""},
+            "fuentes": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["galiciana"]},
+                "default": ["galiciana"],
+            },
+            "max_consultas": {"type": "integer", "minimum": 1, "maximum": 10, "default": 8},
+            "max_resultados_por_fuente": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 150,
+                "default": 80,
+            },
+        },
+        "additionalProperties": False,
+    }
+    universal_process_request = {
+        "type": "object",
+        "required": ["investigation_id"],
+        "properties": {
+            "investigation_id": {"type": "string"},
+            "elementos_por_lote": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+            "presupuesto_segundos": {"type": "integer", "minimum": 1, "maximum": 55, "default": 50},
+            "fuentes": {"type": "array", "items": {"type": "string"}, "default": []},
+        },
+        "additionalProperties": False,
+    }
+    universal_report_request = {
+        "type": "object",
+        "required": ["investigation_id"],
+        "properties": {
+            "investigation_id": {"type": "string"},
+            "desde": {"type": "integer", "minimum": 0, "default": 0},
+            "max_resultados": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            "incluir_pendientes": {"type": "boolean", "default": True},
+        },
+        "additionalProperties": False,
+    }
+    universal_read_request = {
+        "type": "object",
+        "required": ["fuente", "url"],
+        "properties": {
+            "fuente": {"type": "string", "enum": ["galiciana"]},
+            "url": {"type": "string", "format": "uri"},
+            "terminos": {"type": "array", "items": {"type": "string"}, "default": []},
+            "max_caracteres": {"type": "integer", "minimum": 1, "maximum": 30000, "default": 12000},
+        },
+        "additionalProperties": False,
+    }
 
     def operation(operation_id: str, summary: str, description: str, schema: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -936,6 +1156,8 @@ def _openapi_schema() -> dict[str, Any]:
 },
                     },
                     "422": {"description": "Datos incompletos o investigación caducada."},
+                    "401": {"description": "Falta X-ROB-Key o no es válida."},
+                    "503": {"description": "Servicio no configurado o no disponible."},
                     "502": {"description": "La fuente remota no respondió correctamente."},
                 },
             }
@@ -944,12 +1166,12 @@ def _openapi_schema() -> dict[str, Any]:
     return {
         "openapi": "3.1.0",
         "info": {
-            "title": "Rob — Genealogista de Galiciana",
+            "title": "Rob — Investigador Genealógico Universal",
             "description": (
-                "Investigaciones reanudables: búsqueda OCR, lectura ALTO por lotes, "
-                "caché, contexto geométrico, páginas contiguas y familia explícita."
+                "Expedientes reanudables y agregados por fuente. Galiciana es el "
+                "primer adaptador, con búsqueda OCR, lectura ALTO y trazabilidad."
             ),
-            "version": "0.7.0",
+            "version": SERVICE_VERSION,
         },
         "servers": [{"url": PUBLIC_BASE_URL}],
         "components": {
@@ -962,6 +1184,30 @@ def _openapi_schema() -> dict[str, Any]:
             }
         },
         "paths": {
+            "/api/investigacion/crear": operation(
+                "crearInvestigacion",
+                "Crear un expediente genealógico universal",
+                "Persiste el expediente general y crea una ejecución hija por fuente.",
+                universal_create_request,
+            ),
+            "/api/investigacion/procesar": operation(
+                "procesarInvestigacion",
+                "Procesar el siguiente lote universal",
+                "Coordina las fuentes abiertas sin exceder el presupuesto total indicado.",
+                universal_process_request,
+            ),
+            "/api/investigacion/informe": operation(
+                "obtenerInformeInvestigacion",
+                "Obtener el informe genealógico agregado",
+                "Agrega cobertura, evidencia, pendientes, relaciones y diagnósticos con trazabilidad por fuente.",
+                universal_report_request,
+            ),
+            "/api/investigacion/leer-fuente": operation(
+                "leerFuenteInvestigacion",
+                "Leer un documento de una fuente concreta",
+                "Delega la lectura en el adaptador y conserva el detalle especializado de la fuente.",
+                universal_read_request,
+            ),
             "/api/galiciana/investigaciones/crear": operation(
                 "crearInvestigacionGaliciana",
                 "Crear una investigación reanudable en Galiciana",
