@@ -13,6 +13,13 @@ Incluye:
 
 La clave de Europeana debe guardarse como variable de entorno y nunca subirse a GitHub.
 
+## Autenticación de rutas operativas
+
+Configura `ROB_ACTION_KEY` como variable secreta en Render (`sync: false`). Los clientes
+deben enviarla en el encabezado `X-ROB-Key` al llamar a `/api/*` o `/mcp`. Las rutas
+`/health`, `/privacy` y `/openapi.json` permanecen públicas. No guardes la clave en el
+repositorio ni la incluyas en URLs.
+
 ## Persistencia de investigaciones
 
 El servicio usa PostgreSQL automáticamente cuando `DATABASE_URL` está definida. En
