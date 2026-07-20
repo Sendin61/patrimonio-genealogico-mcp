@@ -116,20 +116,112 @@ def _fact_support(window: str, terms: list[str], indicator: str) -> str | None:
 
 
 def _relevant_fragment(text: str, terms: list[str], maximum: int) -> str:
-    text = str(text or "").strip()
+    return _best_relevant_fragment(text, terms[:1], terms[1:], [], maximum)
+
+
+def _search_normalise_with_index_map(value: str) -> tuple[str, list[int]]:
+    normalised: list[str] = []
+    original_indexes: list[int] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if character == "-" and index + 1 < len(value) and value[index + 1] in "\r\n":
+            index += 1
+            while index < len(value) and value[index] in "\r\n":
+                index += 1
+            while index < len(value) and value[index] in " \t":
+                index += 1
+            continue
+        if character.isspace():
+            if normalised and normalised[-1] != " ":
+                normalised.append(" ")
+                original_indexes.append(index)
+            index += 1
+            continue
+        for folded in unicodedata.normalize("NFKD", character.casefold()):
+            if not unicodedata.combining(folded):
+                normalised.append(folded)
+                original_indexes.append(index)
+        index += 1
+    return "".join(normalised), original_indexes
+
+
+def _search_term(value: str) -> str:
+    value = re.sub(r'["“”«»]+', " ", str(value or ""))
+    normalised, _ = _search_normalise_with_index_map(value)
+    return normalised.strip(" ,;:()[]{}")
+
+
+def _best_relevant_match(
+    text: str,
+    canonical_names: list[str],
+    variants: list[str],
+    queries: list[str],
+) -> tuple[int, int] | None:
+    normalised, index_map = _search_normalise_with_index_map(text)
+    if not normalised or not index_map:
+        return None
+    candidates: list[tuple[int, int, int, int]] = []
+    groups = ((4, canonical_names), (3, variants), (2, queries))
+    for priority, values in groups:
+        for value in values:
+            needle = _search_term(value)
+            if not needle:
+                continue
+            for match in re.finditer(rf"(?<!\w){re.escape(needle)}(?!\w)", normalised):
+                candidates.append((priority, len(needle.split()), match.start(), match.end()))
+    if candidates:
+        _, _, start, end = max(candidates, key=lambda item: (item[0], item[1], -item[2]))
+        return index_map[start], index_map[end - 1] + 1
+
+    tokens = {
+        token
+        for value in [*canonical_names, *variants, *queries]
+        for token in re.findall(r"\w+", _search_term(value))
+        if len(token) >= 3
+    }
+    partials: list[tuple[int, int, int]] = []
+    for token in tokens:
+        for match in re.finditer(rf"(?<!\w){re.escape(token)}(?!\w)", normalised):
+            lower = max(0, match.start() - 180)
+            upper = min(len(normalised), match.end() + 180)
+            local = normalised[lower:upper]
+            score = sum(bool(re.search(rf"(?<!\w){re.escape(item)}(?!\w)", local)) for item in tokens)
+            partials.append((score, match.start(), match.end()))
+    if not partials:
+        return None
+    _, start, end = max(partials, key=lambda item: (item[0], -item[1]))
+    return index_map[start], index_map[end - 1] + 1
+
+
+def _best_relevant_fragment(
+    text: str,
+    canonical_names: list[str],
+    variants: list[str],
+    queries: list[str],
+    maximum: int,
+) -> str:
+    text = str(text or "")
     if maximum <= 0 or not text:
         return ""
-    matches = _original_matches(text, terms)
-    centre = matches[0][0] if matches else 0
-    start = max(0, centre - maximum // 2)
+    match = _best_relevant_match(text, canonical_names, variants, queries)
+    if match is None:
+        fallback = text.strip()[:maximum]
+        if len(text.strip()) > maximum and fallback:
+            fallback = fallback[:-1] + "…"
+        return fallback
+    match_start, _ = match
+    start = max(0, match_start - maximum // 3)
     end = min(len(text), start + maximum)
     start = max(0, end - maximum)
-    fragment = text[start:end].strip()
-    if start:
-        fragment = "…" + fragment[1:]
-    if end < len(text):
-        fragment = fragment[:-1] + "…"
-    return fragment
+    leading = start > 0
+    trailing = end < len(text)
+    content_limit = max(0, maximum - int(leading) - int(trailing))
+    start = max(0, match_start - content_limit // 3)
+    end = min(len(text), start + content_limit)
+    start = max(0, end - content_limit)
+    fragment = ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
+    return fragment[:maximum]
 
 
 def _deduplicate_diagnostics(
@@ -256,6 +348,24 @@ def _diagnostic(exc: BaseException, *, operation: str) -> dict[str, str]:
     }
 
 
+def _safe_processing_diagnostic(
+    exc: BaseException, *, operation: str
+) -> dict[str, Any]:
+    status_code = getattr(exc, "status_code", None)
+    diagnostic: dict[str, Any] = {
+        "operacion": operation,
+        "tipo": "timeout" if isinstance(exc, TimeoutError) else "error_fuente",
+        "mensaje": (
+            "La fuente agotó su parte del presupuesto."
+            if isinstance(exc, TimeoutError)
+            else "La fuente no pudo procesar este lote."
+        ),
+    }
+    if isinstance(status_code, int):
+        diagnostic["status_code"] = status_code
+    return diagnostic
+
+
 class UniversalInvestigationEngine:
     """Persisted coordinator over explicitly registered source adapters."""
 
@@ -284,15 +394,35 @@ class UniversalInvestigationEngine:
             output.append(name)
         return output
 
-    @staticmethod
-    def _overall_status(runs: list[dict[str, Any]]) -> str:
+    def _run_has_useful_results(self, run: dict[str, Any]) -> bool:
+        source_id = run.get("source_investigation_id")
+        if not source_id:
+            return False
+        try:
+            report = self.adapters[run["source_name"]].get_report(
+                str(source_id), offset=0, maximum_results=1, include_pending=False
+            )
+        except Exception:
+            return False
+        return bool(
+            int(report.get("paginas_leidas") or 0) > 0
+            or report.get("evidencias_documentales")
+        )
+
+    def _overall_status(self, runs: list[dict[str, Any]]) -> str:
         if not runs:
             return "failed"
         statuses = [run["status"] for run in runs]
         if all(status == "complete" for status in statuses):
             return "complete"
         if all(status in TERMINAL_SOURCE_STATUSES for status in statuses):
-            return "partial" if "complete" in statuses else "failed"
+            if "complete" in statuses:
+                return "partial"
+            return (
+                "partial"
+                if any(self._run_has_useful_results(run) for run in runs)
+                else "failed"
+            )
         return "processing"
 
     def _refresh_status(self, investigation_id: str) -> str:
@@ -473,7 +603,8 @@ class UniversalInvestigationEngine:
                 )
                 break
             try:
-                async with asyncio.timeout(remaining):
+                allocation = remaining / max(1, len(open_runs) - run_index)
+                async with asyncio.timeout(allocation):
                     run = await self._ensure_child(investigation, run)
                     if run["status"] == "complete":
                         details.append(self._source_summary(run))
@@ -484,7 +615,7 @@ class UniversalInvestigationEngine:
                     result = await self.adapters[source_name].process_next_batch(
                         str(run["source_investigation_id"]),
                         batch_size=max(1, batch_size),
-                        time_budget_seconds=remaining,
+                        time_budget_seconds=allocation,
                     )
                 updated = self.store.update_run(
                     investigation_id,
@@ -495,15 +626,17 @@ class UniversalInvestigationEngine:
                 detail = self._source_summary(updated)
                 detail["detalle_fuente"] = result.get("detail", result)
                 details.append(detail)
-            except TimeoutError:
-                details.extend(
-                    self._mark_budget_exhausted(
-                        investigation_id,
-                        open_runs[run_index:],
-                        first_source_started=True,
-                    )
+            except TimeoutError as exc:
+                updated = self.store.update_run(
+                    investigation_id,
+                    source_name,
+                    status="pending",
+                    diagnostics=[
+                        *previous_diagnostics,
+                        _safe_processing_diagnostic(exc, operation="procesar"),
+                    ],
                 )
-                break
+                details.append(self._source_summary(updated))
             except Exception as exc:
                 updated = self.store.update_run(
                     investigation_id,
@@ -511,7 +644,7 @@ class UniversalInvestigationEngine:
                     status="failed",
                     diagnostics=[
                         *previous_diagnostics,
-                        _diagnostic(exc, operation="procesar"),
+                        _safe_processing_diagnostic(exc, operation="procesar"),
                     ],
                 )
                 details.append(self._source_summary(updated))
@@ -522,7 +655,9 @@ class UniversalInvestigationEngine:
                     status="pending",
                     diagnostics=[
                         *previous_diagnostics,
-                        _diagnostic(exc, operation="procesar_interrumpido"),
+                        _safe_processing_diagnostic(
+                            exc, operation="procesar_interrumpido"
+                        ),
                     ],
                 )
                 self._refresh_status(investigation_id)
@@ -634,6 +769,7 @@ class UniversalInvestigationEngine:
         pending: list[dict[str, Any]] = []
         relations: list[dict[str, Any]] = []
         source_coverage: list[dict[str, Any]] = []
+        fragment_terms: dict[str, tuple[list[str], list[str], list[str]]] = {}
         offset = max(0, offset)
         maximum_results = max(1, maximum_results)
         required_per_kind = offset + maximum_results
@@ -651,6 +787,11 @@ class UniversalInvestigationEngine:
                         str(source_id),
                         required_per_kind=required_per_kind,
                         include_pending=include_pending,
+                    )
+                    fragment_terms[source_name] = (
+                        [investigation["target"].name],
+                        list(investigation["target"].variants),
+                        [str(item) for item in source_report.get("consultas", [])],
                     )
                     total_evidence += int(source_report.get("total_evidencias") or 0)
                     total_pending += int(source_report.get("total_pendientes") or 0)
@@ -727,7 +868,11 @@ class UniversalInvestigationEngine:
         pending = (
             pending[offset : offset + maximum_results] if include_pending else []
         )
-        terms = [investigation["target"].name, *investigation["target"].variants]
+        default_fragment_terms = (
+            [investigation["target"].name],
+            list(investigation["target"].variants),
+            [],
+        )
         text_budget = (
             COMPACT_REPORT_TEXT_LIMIT
             if mode == "compacto"
@@ -757,6 +902,7 @@ class UniversalInvestigationEngine:
                 ),
                 "",
             )
+            terms = [investigation["target"].name, *investigation["target"].variants]
             inferred_categories, facts = _document_facts(source_text, terms)
             existing_categories = list(item.get("categorias") or [])
             categories = list(
@@ -765,7 +911,12 @@ class UniversalInvestigationEngine:
             if not categories:
                 categories = ["mención nominal"]
             per_item_limit = maximum_context_characters
-            fragment = _relevant_fragment(source_text, terms, per_item_limit)
+            canonical, variants, queries = fragment_terms.get(
+                str(item.get("fuente") or ""), default_fragment_terms
+            )
+            fragment = _best_relevant_fragment(
+                source_text, canonical, variants, queries, per_item_limit
+            )
             if mode == "compacto":
                 result_item = {key: item.get(key) for key in compact_fields}
                 result_item["categorias"] = categories

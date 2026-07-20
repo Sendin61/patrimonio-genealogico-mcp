@@ -12,6 +12,7 @@ from rob.investigations.engine import (
     COMPACT_REPORT_TEXT_LIMIT,
     COMPLETE_REPORT_TEXT_LIMIT,
     UniversalInvestigationEngine,
+    _best_relevant_fragment,
     _document_facts,
     _is_structural_text,
 )
@@ -209,17 +210,24 @@ async def test_partial_when_one_source_completes_and_another_fails(tmp_path) -> 
     runs = {run["source_name"]: run for run in store.source_runs(created["investigation_id"])}
     assert runs["documentada"]["status"] == "complete"
     assert runs["fallida"]["status"] == "failed"
-    assert "falló al procesar" in runs["fallida"]["diagnostics"][0]["mensaje"]
+    assert runs["fallida"]["diagnostics"][0]["mensaje"] == (
+        "La fuente no pudo procesar este lote."
+    )
 
 
 @pytest.mark.asyncio
-async def test_process_uses_one_global_deadline_and_leaves_unstarted_sources_pending(
+async def test_process_uses_one_global_deadline_and_shares_budget_between_sources(
     tmp_path,
 ) -> None:
     class SlowSource(FakeSourceAdapter):
+        def __init__(self, source_name):
+            super().__init__(source_name)
+            self.allocations = []
+
         async def process_next_batch(self, source_investigation_id, **kwargs):
-            del source_investigation_id, kwargs
+            del source_investigation_id
             self.processed += 1
+            self.allocations.append(kwargs["time_budget_seconds"])
             await asyncio.sleep(0.2)
             return {"status": "complete", "complete": True}
 
@@ -233,20 +241,188 @@ async def test_process_uses_one_global_deadline_and_leaves_unstarted_sources_pen
     loop = asyncio.get_running_loop()
     started = loop.time()
     result = await engine.process(
-        created["investigation_id"], time_budget_seconds=0.03
+        created["investigation_id"], time_budget_seconds=0.09
     )
     elapsed = loop.time() - started
 
     assert elapsed < 0.12
     assert result["estado"] == "processing"
-    assert adapters[0].processed == 1
-    assert [adapter.processed for adapter in adapters[1:]] == [0, 0]
+    assert [adapter.processed for adapter in adapters] == [1, 1, 1]
+    assert all(0 < adapter.allocations[0] <= 0.031 for adapter in adapters)
     runs = store.source_runs(created["investigation_id"])
     assert [run["status"] for run in runs] == ["pending", "pending", "pending"]
-    assert runs[1]["diagnostics"][-1]["operacion"] == (
-        "presupuesto_agotado_antes_de_iniciar"
+    assert all(run["diagnostics"][-1]["tipo"] == "timeout" for run in runs)
+
+
+@pytest.mark.asyncio
+async def test_process_isolates_galiciana_failure_and_processes_exa(tmp_path) -> None:
+    galiciana = FakeSourceAdapter("galiciana", fail_process=True)
+    exa = FakeSourceAdapter("exa")
+    engine, store = make_engine(tmp_path, galiciana, exa)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"), requested_sources=["galiciana", "exa"]
     )
-    assert "antes de iniciar" in runs[1]["diagnostics"][-1]["mensaje"]
+
+    result = await engine.process(created["investigation_id"])
+
+    assert galiciana.processed == exa.processed == 1
+    assert result["estado"] == "partial"
+    runs = {run["source_name"]: run for run in store.source_runs(created["investigation_id"])}
+    assert runs["galiciana"]["status"] == "failed"
+    assert runs["exa"]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_process_isolates_exa_failure_and_preserves_galiciana_work(tmp_path) -> None:
+    galiciana = FakeSourceAdapter("galiciana")
+    exa = FakeSourceAdapter("exa", fail_process=True)
+    engine, store = make_engine(tmp_path, galiciana, exa)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"), requested_sources=["galiciana", "exa"]
+    )
+
+    result = await engine.process(created["investigation_id"])
+
+    assert galiciana.processed == exa.processed == 1
+    assert result["estado"] == "partial"
+    runs = {run["source_name"]: run for run in store.source_runs(created["investigation_id"])}
+    assert runs["galiciana"]["status"] == "complete"
+    assert runs["exa"]["status"] == "failed"
+    assert engine.report(created["investigation_id"])["evidencias_documentales"]
+
+
+@pytest.mark.asyncio
+async def test_process_two_failed_sources_without_evidence_is_failed(tmp_path) -> None:
+    class EmptyFailedSource(FakeSourceAdapter):
+        def get_report(self, source_investigation_id, **kwargs):
+            del source_investigation_id, kwargs
+            return {
+                "paginas_leidas": 0,
+                "evidencias_documentales": [],
+                "paginas_no_leidas": [],
+                "familia_documentada_o_candidata": [],
+            }
+
+    galiciana = EmptyFailedSource("galiciana", fail_process=True)
+    exa = EmptyFailedSource("exa", fail_process=True)
+    engine, _ = make_engine(tmp_path, galiciana, exa)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"), requested_sources=["galiciana", "exa"]
+    )
+
+    result = await engine.process(created["investigation_id"])
+
+    assert result["estado"] == "failed"
+    assert galiciana.processed == exa.processed == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_sources_with_persisted_evidence_are_partial(tmp_path) -> None:
+    galiciana = FakeSourceAdapter("galiciana", fail_process=True)
+    exa = FakeSourceAdapter("exa", fail_process=True)
+    engine, _ = make_engine(tmp_path, galiciana, exa)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"), requested_sources=["galiciana", "exa"]
+    )
+
+    result = await engine.process(created["investigation_id"])
+
+    assert result["estado"] == "partial"
+
+
+@pytest.mark.asyncio
+async def test_process_source_filter_is_exclusive(tmp_path) -> None:
+    galiciana = FakeSourceAdapter("galiciana")
+    exa = FakeSourceAdapter("exa")
+    engine, store = make_engine(tmp_path, galiciana, exa)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"), requested_sources=["galiciana", "exa"]
+    )
+
+    result = await engine.process(created["investigation_id"], sources=["exa"])
+
+    assert galiciana.processed == 0
+    assert exa.processed == 1
+    assert result["estado"] == "processing"
+    runs = {run["source_name"]: run for run in store.source_runs(created["investigation_id"])}
+    assert runs["galiciana"]["status"] == "processing"
+    assert runs["exa"]["status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_processing_diagnostics_do_not_copy_external_messages(tmp_path) -> None:
+    secret = "EXA_API_KEY=super-secret upstream-body=private"
+
+    class LeakingSource(FakeSourceAdapter):
+        async def process_next_batch(self, source_investigation_id, **kwargs):
+            del source_investigation_id, kwargs
+            self.processed += 1
+            error = RuntimeError(secret)
+            error.status_code = 503
+            raise error
+
+    source = LeakingSource("exa")
+    engine, store = make_engine(tmp_path, source)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"), requested_sources=["exa"]
+    )
+    await engine.process(created["investigation_id"])
+
+    diagnostic = store.source_runs(created["investigation_id"])[0]["diagnostics"][-1]
+    assert diagnostic == {
+        "operacion": "procesar",
+        "tipo": "error_fuente",
+        "mensaje": "La fuente no pudo procesar este lote.",
+        "status_code": 503,
+    }
+    assert secret not in json.dumps(diagnostic)
+
+
+def test_relevant_fragment_centres_late_literal_full_name() -> None:
+    ocr = "Inicio de página. " + "x" * 1200 + " Andrés Fernández Táboas fue citado literalmente. Fin."
+    fragment = _best_relevant_fragment(
+        ocr, ["Andrés Fernández Táboas"], [], [], 180
+    )
+    assert "Andrés Fernández Táboas" in fragment
+    assert fragment.startswith("…")
+    assert len(fragment) <= 180
+
+
+@pytest.mark.parametrize(
+    "ocr,name,literal",
+    [
+        ("Texto previo " * 20 + "Andres Fernandez Taboas consta aquí.", "Andrés Fernández Táboas", "Andres Fernandez Taboas"),
+        ("Texto previo " * 20 + "Andrés Fernán-\ndez Táboas consta aquí.", "Andrés Fernández Táboas", "Andrés Fernán-\ndez Táboas"),
+        ("Texto previo " * 20 + "Andrés   Fernández\n\nTáboas consta aquí.", "Andrés Fernández Táboas", "Andrés   Fernández\n\nTáboas"),
+    ],
+)
+def test_relevant_fragment_matches_ocr_variations_literally(ocr, name, literal) -> None:
+    fragment = _best_relevant_fragment(ocr, [name], [], [], 160)
+    assert literal in fragment
+    assert len(fragment) <= 160
+
+
+def test_relevant_fragment_prioritises_full_name_over_earlier_variant() -> None:
+    ocr = "A. Fernández aparece primero. " + "x" * 300 + " Andrés Fernández Táboas aparece completo."
+    fragment = _best_relevant_fragment(
+        ocr, ["Andrés Fernández Táboas"], ["A. Fernández"], [], 130
+    )
+    assert "Andrés Fernández Táboas" in fragment
+    assert "A. Fernández" not in fragment
+
+
+def test_relevant_fragment_uses_saved_query_and_falls_back_to_start() -> None:
+    ocr = "Cabecera " + "x" * 500 + " vecino de Ribadeo figura en el padrón."
+    matched = _best_relevant_fragment(
+        ocr, ["Nombre ausente"], [], ["vecino de Ribadeo"], 120
+    )
+    fallback = _best_relevant_fragment(
+        ocr, ["Nombre ausente"], [], ["consulta ausente"], 40
+    )
+    assert "vecino de Ribadeo" in matched
+    assert fallback.startswith("Cabecera") and fallback.endswith("…")
+    assert len(matched) <= 120
+    assert len(fallback) <= 40
 
 
 @pytest.mark.asyncio
