@@ -60,6 +60,23 @@ def _normalise(value: str) -> str:
     return "".join(char for char in decomposed if not unicodedata.combining(char))
 
 
+def _searchable(value: str) -> str:
+    value = re.sub(r"-\r?\n[ \t]*", "", str(value or ""))
+    value = re.sub(r"\s+", " ", value)
+    return _normalise(value)
+
+
+def _contains_target(text: str, terms: list[str]) -> bool:
+    searchable = _searchable(text)
+    if not searchable:
+        return False
+    for term in terms:
+        wanted = _searchable(term).strip()
+        if wanted and re.search(rf"(?<!\w){re.escape(wanted)}(?!\w)", searchable):
+            return True
+    return False
+
+
 def _contexts(
     text: str,
     terms: list[str],
@@ -222,6 +239,34 @@ class GalicianaSourceAdapter:
             maximum_results=maximum_results,
             include_unread=include_pending,
         )
+        try:
+            rows = self.engine.store.report_rows(
+                source_investigation_id,
+                limit=maximum_results,
+                offset=offset,
+            )
+            query = self.engine.store.query(source_investigation_id)
+            terms = [query.name, *query.variants]
+        except (AttributeError, KeyError, TypeError):
+            rows = []
+            terms = []
+
+        read_rows = [row for row in rows if row.get("status") == "read"]
+        for evidence, row in zip(
+            report.get("evidencias_documentales", []),
+            read_rows,
+            strict=False,
+        ):
+            full_text = str(row.get("full_text") or "")
+            current_context = str(evidence.get("contexto") or "")
+            if (
+                full_text
+                and terms
+                and _contains_target(full_text, terms)
+                and not _contains_target(current_context, terms)
+            ):
+                evidence["contexto"] = full_text
+
         report["diagnosticos_fuente"] = self._diagnostics(source_investigation_id)
         return report
 
