@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import unicodedata
 from collections.abc import Iterable
 from typing import Any
 
@@ -10,6 +12,239 @@ from .store import UniversalInvestigationStore
 
 
 TERMINAL_SOURCE_STATUSES = {"complete", "failed"}
+COMPACT_REPORT_TEXT_LIMIT = 50_000
+COMPLETE_REPORT_TEXT_LIMIT = 200_000
+LOCAL_WINDOW_RADIUS = 240
+MAX_FACT_SUPPORT_CHARACTERS = 320
+
+_STRUCTURAL_TEXT_FIELDS = {
+    "fecha",
+    "publicacion",
+    "titulo",
+    "pagina",
+    "fuente",
+    "investigation_id_fuente",
+}
+
+_DOCUMENT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("nombramiento", ("nombrado", "nombramiento", "designado")),
+    ("cargo público", ("alcalde", "concejal", "diputado", "gobernador", "secretario municipal")),
+    ("lista electoral", ("lista electoral", "censo electoral", "elector", "candidato")),
+    ("contribución o matrícula", ("contribución", "contribuyente", "matrícula", "matriculado")),
+    ("residencia", ("domiciliado", "residente", "vecino de", "domicilio")),
+    ("profesión", ("profesión", "oficio", "médico", "abogado", "jornalero", "comerciante")),
+    ("procedimiento judicial", ("juzgado", "procesado", "demandante", "demandado", "sentencia", "expediente judicial")),
+    ("propiedad", ("propietario", "propiedad", "finca", "heredad")),
+    ("parentesco explícito", ("hijo de", "hija de", "padre de", "madre de", "esposo de", "esposa de", "cónyuge")),
+)
+
+
+def _normalise_text(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
+
+
+def _normalise_with_index_map(value: str) -> tuple[str, list[int]]:
+    normalised: list[str] = []
+    original_indexes: list[int] = []
+    for original_index, character in enumerate(value):
+        for folded in unicodedata.normalize("NFKD", character.casefold()):
+            if unicodedata.combining(folded):
+                continue
+            normalised.append(folded)
+            original_indexes.append(original_index)
+    return "".join(normalised), original_indexes
+
+
+def _original_matches(text: str, terms: Iterable[str]) -> list[tuple[int, int]]:
+    normalised, index_map = _normalise_with_index_map(text)
+    matches: list[tuple[int, int]] = []
+    for term in terms:
+        needle = _normalise_text(str(term).strip())
+        if not needle:
+            continue
+        for match in re.finditer(rf"(?<!\w){re.escape(needle)}(?!\w)", normalised):
+            start = index_map[match.start()]
+            end = index_map[match.end() - 1] + 1
+            matches.append((start, end))
+    return sorted(set(matches))
+
+
+def _local_windows(text: str, terms: list[str]) -> list[str]:
+    windows: list[str] = []
+    for name_start, name_end in _original_matches(text, terms):
+        lower = max(0, name_start - LOCAL_WINDOW_RADIUS)
+        upper = min(len(text), name_end + LOCAL_WINDOW_RADIUS)
+        prefix = text[lower:name_start]
+        suffix = text[name_end:upper]
+        left_delimiters = [
+            match.end() for match in re.finditer(r"[.!?;\r\n]", prefix)
+        ]
+        right_delimiter = re.search(r"[.!?;\r\n]", suffix)
+        start = lower + (left_delimiters[-1] if left_delimiters else 0)
+        end = name_end + (
+            right_delimiter.start() if right_delimiter else len(suffix)
+        )
+        window = text[start:end].strip()
+        if window and window not in windows:
+            windows.append(window)
+    return windows
+
+
+def _fact_support(window: str, terms: list[str], indicator: str) -> str | None:
+    name_matches = _original_matches(window, terms)
+    indicator_matches = _original_matches(window, [indicator])
+    candidates: list[tuple[int, int]] = []
+    for name_start, name_end in name_matches:
+        for indicator_start, indicator_end in indicator_matches:
+            candidates.append(
+                (min(name_start, indicator_start), max(name_end, indicator_end))
+            )
+    if not candidates:
+        return None
+    core_start, core_end = min(candidates, key=lambda span: span[1] - span[0])
+    if core_end - core_start > MAX_FACT_SUPPORT_CHARACTERS:
+        return None
+    padding = MAX_FACT_SUPPORT_CHARACTERS - (core_end - core_start)
+    start = max(0, core_start - padding // 2)
+    end = min(len(window), start + MAX_FACT_SUPPORT_CHARACTERS)
+    start = max(0, end - MAX_FACT_SUPPORT_CHARACTERS)
+    return window[start:end].strip()
+
+
+def _relevant_fragment(text: str, terms: list[str], maximum: int) -> str:
+    text = str(text or "").strip()
+    if maximum <= 0 or not text:
+        return ""
+    matches = _original_matches(text, terms)
+    centre = matches[0][0] if matches else 0
+    start = max(0, centre - maximum // 2)
+    end = min(len(text), start + maximum)
+    start = max(0, end - maximum)
+    fragment = text[start:end].strip()
+    if start:
+        fragment = "…" + fragment[1:]
+    if end < len(text):
+        fragment = fragment[:-1] + "…"
+    return fragment
+
+
+def _deduplicate_diagnostics(
+    diagnostics: Iterable[dict[str, Any]], source_name: str
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for diagnostic in diagnostics:
+        key = (
+            diagnostic.get("fuente", source_name),
+            diagnostic.get("query"),
+            diagnostic.get("ok"),
+            diagnostic.get("error_type", diagnostic.get("tipo")),
+            diagnostic.get("error", diagnostic.get("mensaje")),
+        )
+        if key not in seen:
+            seen.add(key)
+            output.append(diagnostic)
+    return output
+
+
+def _document_facts(
+    text: str, terms: list[str]
+) -> tuple[list[str], list[dict[str, Any]]]:
+    categories: list[str] = []
+    facts: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for window in _local_windows(text, terms):
+        if not _original_matches(window, terms):
+            continue
+        for category, indicators in _DOCUMENT_RULES:
+            matched = next(
+                (
+                    indicator
+                    for indicator in indicators
+                    if _original_matches(window, [indicator])
+                ),
+                None,
+            )
+            if matched is None:
+                continue
+            support = _fact_support(window, terms, matched)
+            if support is None:
+                continue
+            key = (category, matched, support)
+            if key in seen:
+                continue
+            seen.add(key)
+            categories.append(category)
+            facts.append(
+                {
+                    "tipo": category,
+                    "valor": matched,
+                    "confianza": 0.8,
+                    "texto_soporte": support,
+                }
+            )
+    return categories, facts
+
+
+def _is_structural_text(key: str) -> bool:
+    return (
+        key in _STRUCTURAL_TEXT_FIELDS
+        or key == "categorias"
+        or key.startswith("url_")
+        or key == "id"
+        or key.endswith("_id")
+    )
+
+
+def _limit_evidence_text(
+    value: Any,
+    remaining: int,
+    *,
+    key: str = "",
+) -> tuple[Any, int, bool]:
+    if isinstance(value, str):
+        if _is_structural_text(key):
+            return value, remaining, False
+        allowed = min(len(value), remaining)
+        return value[:allowed], remaining - allowed, allowed < len(value)
+    if isinstance(value, list):
+        output: list[Any] = []
+        truncated = False
+        for item in value:
+            limited, remaining, item_truncated = _limit_evidence_text(
+                item, remaining, key=key
+            )
+            output.append(limited)
+            truncated = truncated or item_truncated
+        return output, remaining, truncated
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        truncated = False
+        for child_key, item in value.items():
+            limited, remaining, item_truncated = _limit_evidence_text(
+                item, remaining, key=str(child_key)
+            )
+            output[child_key] = limited
+            truncated = truncated or item_truncated
+        return output, remaining, truncated
+    return value, remaining, False
+
+
+def _without_equivalent_ocr_fields(item: dict[str, Any]) -> dict[str, Any]:
+    output = dict(item)
+    canonical = str(output.get("contexto") or "")
+    seen_texts = {canonical} if canonical else set()
+    for key in ("texto_ocr", "texto_visible", "texto", "contenido_ocr"):
+        value = output.get(key)
+        if isinstance(value, str) and value in seen_texts:
+            output.pop(key, None)
+        elif isinstance(value, str):
+            seen_texts.add(value)
+    return output
 
 
 def _diagnostic(exc: BaseException, *, operation: str) -> dict[str, str]:
@@ -377,7 +612,13 @@ class UniversalInvestigationEngine:
         offset: int = 0,
         maximum_results: int = 20,
         include_pending: bool = True,
+        mode: str = "compacto",
+        include_context: bool = False,
+        maximum_context_characters: int = 800,
     ) -> dict[str, Any]:
+        if mode not in {"compacto", "completo"}:
+            raise ValueError("modo debe ser 'compacto' o 'completo'.")
+        maximum_context_characters = min(max(int(maximum_context_characters), 0), 5000)
         investigation = self.store.require(investigation_id)
         runs = self.store.source_runs(investigation_id)
         source_order = {
@@ -426,6 +667,9 @@ class UniversalInvestigationEngine:
                             *coverage.get("diagnosticos", []),
                             *source_diagnostics,
                         ]
+                    coverage["diagnosticos"] = _deduplicate_diagnostics(
+                        coverage.get("diagnosticos", []), source_name
+                    )
                     for item in source_report.get("evidencias_documentales", []):
                         evidence.append(
                             {
@@ -469,6 +713,9 @@ class UniversalInvestigationEngine:
                         status=run["status"],
                         diagnostics=diagnostics,
                     )
+            coverage["diagnosticos"] = _deduplicate_diagnostics(
+                coverage.get("diagnosticos", []), source_name
+            )
             source_coverage.append(coverage)
 
         runs = self.store.source_runs(investigation_id)
@@ -476,6 +723,71 @@ class UniversalInvestigationEngine:
         pending = (
             pending[offset : offset + maximum_results] if include_pending else []
         )
+        terms = [investigation["target"].name, *investigation["target"].variants]
+        text_budget = (
+            COMPACT_REPORT_TEXT_LIMIT
+            if mode == "compacto"
+            else COMPLETE_REPORT_TEXT_LIMIT
+        )
+        text_limit = text_budget
+        text_truncated = False
+        normalised_evidence: list[dict[str, Any]] = []
+        compact_fields = (
+            "fecha", "publicacion", "titulo", "pagina", "fuente", "puntuacion",
+            "categorias", "url_pagina", "url_ocr", "url_imagen",
+            "investigation_id_fuente",
+        )
+        for raw_item in evidence:
+            item = _without_equivalent_ocr_fields(raw_item)
+            full_context = str(item.get("contexto") or "")
+            source_text = full_context or next(
+                (
+                    str(item.get(key) or "")
+                    for key in (
+                        "texto_ocr",
+                        "texto_visible",
+                        "texto",
+                        "contenido_ocr",
+                    )
+                    if item.get(key)
+                ),
+                "",
+            )
+            inferred_categories, facts = _document_facts(source_text, terms)
+            existing_categories = list(item.get("categorias") or [])
+            categories = list(
+                dict.fromkeys([*existing_categories, *inferred_categories])
+            )
+            if not categories:
+                categories = ["mención nominal"]
+            per_item_limit = maximum_context_characters
+            fragment = _relevant_fragment(source_text, terms, per_item_limit)
+            if mode == "compacto":
+                result_item = {key: item.get(key) for key in compact_fields}
+                result_item["categorias"] = categories
+                result_item["fragmento_relevante"] = fragment
+                result_item["hechos_extraidos"] = facts
+            else:
+                result_item = item
+                result_item["categorias"] = categories
+                result_item["fragmento_relevante"] = fragment
+                result_item["hechos_extraidos"] = facts
+            if include_context and full_context:
+                result_item["contexto"] = full_context
+            else:
+                result_item.pop("contexto", None)
+            result_item, text_budget, item_truncated = _limit_evidence_text(
+                result_item, text_budget
+            )
+            text_truncated = text_truncated or item_truncated
+            normalised_evidence.append(result_item)
+        evidence = normalised_evidence
+        diagnostics_by_source = {
+            run["source_name"]: _deduplicate_diagnostics(
+                run.get("diagnostics", []), run["source_name"]
+            )
+            for run in runs
+        }
         return {
             "investigation_id": investigation_id,
             "persona_objetivo": investigation["target"].name,
@@ -487,9 +799,9 @@ class UniversalInvestigationEngine:
             "evidencias_documentales": evidence,
             "elementos_pendientes": pending,
             "relaciones_familiares_documentadas": relations,
-            "diagnosticos_por_fuente": {
-                run["source_name"]: run.get("diagnostics", []) for run in runs
-            },
+            "diagnosticos_por_fuente": diagnostics_by_source,
+            "texto_truncado": text_truncated,
+            "limite_texto": text_limit,
             "paginacion": {
                 "desde": offset,
                 "devueltos": len(evidence),
