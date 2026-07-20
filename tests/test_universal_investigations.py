@@ -134,7 +134,7 @@ async def test_process_and_aggregate_source_report(tmp_path) -> None:
     assert processed["completada"] is True
     assert adapter.processed == 1
 
-    report = engine.report(universal_id)
+    report = engine.report(universal_id, mode="completo", include_context=True)
     evidence = report["evidencias_documentales"][0]
     assert evidence["fuente"] == "galiciana"
     assert evidence["investigation_id_fuente"].startswith("galiciana-child-")
@@ -327,6 +327,148 @@ async def test_report_applies_one_deterministic_global_pagination(tmp_path) -> N
     ] == ["second-pending-1", "second-pending-2"]
     assert page_one["paginacion"]["siguiente_desde_pendientes"] == 3
     assert page_two["paginacion"]["siguiente_desde_pendientes"] is None
+
+
+@pytest.mark.asyncio
+async def test_compact_report_bounds_one_hundred_ocr_evidences(tmp_path) -> None:
+    class LargeReportSource(FakeSourceAdapter):
+        def __init__(self):
+            super().__init__(complete_on_create=True)
+            self.rows = [
+                {
+                    "fecha": "1910-01-01",
+                    "publicacion": "Boletín",
+                    "titulo": f"Documento {index}",
+                    "pagina": str(index + 1),
+                    "puntuacion": 0.9,
+                    "categorias": [],
+                    "url_pagina": f"https://example.invalid/{index}",
+                    "url_ocr": f"https://example.invalid/{index}/alto",
+                    "url_imagen": f"https://example.invalid/{index}/image",
+                    "contexto": (
+                        "X" * 4_000
+                        + " Persona Objetivo fue nombrado alcalde "
+                        + "Y" * 4_000
+                    ),
+                    "texto_ocr": "OCR" * 10_000,
+                    "texto_visible": "VISIBLE" * 10_000,
+                }
+                for index in range(100)
+            ]
+
+        def get_report(self, source_investigation_id, **kwargs):
+            offset = kwargs["offset"]
+            page = self.rows[offset : offset + kwargs["maximum_results"]]
+            return {
+                "cobertura": 1.0,
+                "total_resultados": 100,
+                "paginas_leidas": 100,
+                "paginas_pendientes": 0,
+                "paginas_fallidas": 0,
+                "evidencias_documentales": page,
+                "paginas_no_leidas": [],
+                "familia_documentada_o_candidata": [],
+                "paginacion": {
+                    "devueltos": len(page),
+                    "siguiente_desde": (
+                        offset + len(page) if offset + len(page) < 100 else None
+                    ),
+                },
+                "source_investigation_id": source_investigation_id,
+            }
+
+    engine, _ = make_engine(tmp_path, LargeReportSource())
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona Objetivo")
+    )
+    report = engine.report(
+        created["investigation_id"], maximum_results=100, maximum_context_characters=800
+    )
+
+    assert len(report["evidencias_documentales"]) == 100
+    assert len(json.dumps(report, ensure_ascii=False)) < 150_000
+    assert all(
+        "texto_ocr" not in item and "texto_visible" not in item and "contexto" not in item
+        for item in report["evidencias_documentales"]
+    )
+    assert all(
+        len(item["fragmento_relevante"]) <= 800
+        for item in report["evidencias_documentales"]
+    )
+    assert (
+        "Persona Objetivo"
+        in report["evidencias_documentales"][0]["fragmento_relevante"]
+    )
+
+    contextual = engine.report(
+        created["investigation_id"],
+        maximum_results=100,
+        maximum_context_characters=5_000,
+        include_context=True,
+    )
+    returned_text = sum(
+        len(item["fragmento_relevante"]) + len(item.get("contexto", ""))
+        for item in contextual["evidencias_documentales"]
+    )
+    assert returned_text <= 50_000
+
+
+@pytest.mark.asyncio
+async def test_report_deduplicates_diagnostics_and_complete_mode_keeps_detail(tmp_path) -> None:
+    class DiagnosticSource(FakeSourceAdapter):
+        def get_report(self, source_investigation_id, **kwargs):
+            del kwargs
+            duplicate = {
+                "fuente": "galiciana", "query": "persona", "ok": False,
+                "error_type": "Timeout", "error": "agotado",
+            }
+            return {
+                "cobertura": 1.0,
+                "total_resultados": 1,
+                "paginas_leidas": 1,
+                "paginas_pendientes": 0,
+                "paginas_fallidas": 0,
+                "diagnosticos_fuente": [duplicate, dict(duplicate)],
+                "evidencias_documentales": [
+                    {
+                        "titulo": "Padrón",
+                        "contexto": "Persona ejerce oficio de comerciante.",
+                        "texto_ocr": "Persona ejerce oficio de comerciante.",
+                        "detalle_especial": 7,
+                    }
+                ],
+                "paginas_no_leidas": [],
+                "familia_documentada_o_candidata": [],
+                "source_investigation_id": source_investigation_id,
+            }
+
+    engine, _ = make_engine(tmp_path, DiagnosticSource(complete_on_create=True))
+    created = await engine.create_investigation(InvestigationTarget(name="Persona"))
+    report = engine.report(
+        created["investigation_id"], mode="completo", include_context=True
+    )
+    evidence = report["evidencias_documentales"][0]
+
+    assert len(report["cobertura_por_fuente"][0]["diagnosticos"]) == 1
+    assert evidence["detalle_especial"] == 7
+    assert evidence["contexto"] == "Persona ejerce oficio de comerciante."
+    assert "texto_ocr" not in evidence
+    assert "profesión" in evidence["categorias"]
+    assert evidence["hechos_extraidos"][0].keys() == {
+        "tipo", "valor", "confianza", "texto_soporte"
+    }
+
+
+@pytest.mark.asyncio
+async def test_extracted_facts_do_not_invent_unstated_family_relationships(tmp_path) -> None:
+    engine, _ = make_engine(tmp_path, FakeSourceAdapter(complete_on_create=True))
+    created = await engine.create_investigation(InvestigationTarget(name="Persona"))
+    report = engine.report(created["investigation_id"])
+    evidence = report["evidencias_documentales"][0]
+
+    assert evidence["categorias"] == ["mención nominal"]
+    assert evidence["hechos_extraidos"] == []
+    assert all("parentesco" not in fact["tipo"] for fact in evidence["hechos_extraidos"])
 
 
 @pytest.mark.asyncio

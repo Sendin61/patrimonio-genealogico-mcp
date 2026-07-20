@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import unicodedata
 from collections.abc import Iterable
 from typing import Any
 
@@ -10,6 +12,113 @@ from .store import UniversalInvestigationStore
 
 
 TERMINAL_SOURCE_STATUSES = {"complete", "failed"}
+COMPACT_REPORT_TEXT_LIMIT = 50_000
+COMPLETE_REPORT_TEXT_LIMIT = 200_000
+
+_DOCUMENT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("nombramiento", ("nombrado", "nombramiento", "designado")),
+    ("cargo público", ("alcalde", "concejal", "diputado", "gobernador", "secretario municipal")),
+    ("lista electoral", ("lista electoral", "censo electoral", "elector", "candidato")),
+    ("contribución o matrícula", ("contribución", "contribuyente", "matrícula", "matriculado")),
+    ("residencia", ("domiciliado", "residente", "vecino de", "domicilio")),
+    ("profesión", ("profesión", "oficio", "médico", "abogado", "jornalero", "comerciante")),
+    ("procedimiento judicial", ("juzgado", "procesado", "demandante", "demandado", "sentencia", "expediente judicial")),
+    ("propiedad", ("propietario", "propiedad", "finca", "heredad")),
+    ("parentesco explícito", ("hijo de", "hija de", "padre de", "madre de", "esposo de", "esposa de", "cónyuge")),
+)
+
+
+def _normalise_text(value: str) -> str:
+    return "".join(
+        character
+        for character in unicodedata.normalize("NFKD", value.casefold())
+        if not unicodedata.combining(character)
+    )
+
+
+def _indicator_position(text: str, indicator: str) -> int:
+    match = re.search(
+        rf"(?<!\w){re.escape(_normalise_text(indicator))}(?!\w)",
+        _normalise_text(text),
+    )
+    return match.start() if match else -1
+
+
+def _relevant_fragment(text: str, terms: list[str], maximum: int) -> str:
+    text = str(text or "").strip()
+    if maximum <= 0 or not text:
+        return ""
+    normalised = _normalise_text(text)
+    positions = [normalised.find(_normalise_text(term)) for term in terms if term.strip()]
+    positions = [position for position in positions if position >= 0]
+    centre = min(positions) if positions else 0
+    start = max(0, centre - maximum // 2)
+    end = min(len(text), start + maximum)
+    start = max(0, end - maximum)
+    fragment = text[start:end].strip()
+    if start:
+        fragment = "…" + fragment[1:]
+    if end < len(text):
+        fragment = fragment[:-1] + "…"
+    return fragment
+
+
+def _deduplicate_diagnostics(
+    diagnostics: Iterable[dict[str, Any]], source_name: str
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for diagnostic in diagnostics:
+        key = (
+            diagnostic.get("fuente", source_name),
+            diagnostic.get("query"),
+            diagnostic.get("ok"),
+            diagnostic.get("error_type", diagnostic.get("tipo")),
+            diagnostic.get("error", diagnostic.get("mensaje")),
+        )
+        if key not in seen:
+            seen.add(key)
+            output.append(diagnostic)
+    return output
+
+
+def _document_facts(text: str) -> tuple[list[str], list[dict[str, Any]]]:
+    categories: list[str] = []
+    facts: list[dict[str, Any]] = []
+    for category, indicators in _DOCUMENT_RULES:
+        matched = next(
+            (indicator for indicator in indicators if _indicator_position(text, indicator) >= 0),
+            None,
+        )
+        if matched is None:
+            continue
+        categories.append(category)
+        position = _indicator_position(text, matched)
+        support = text[max(0, position - 90) : position + len(matched) + 90].strip()
+        facts.append(
+            {
+                "tipo": category,
+                "valor": matched,
+                "confianza": 0.8,
+                "texto_soporte": support,
+            }
+        )
+    if not categories:
+        categories.append("mención nominal")
+    return categories, facts
+
+
+def _without_equivalent_ocr_fields(item: dict[str, Any]) -> dict[str, Any]:
+    output = dict(item)
+    canonical = str(output.get("contexto") or "")
+    seen_texts = {canonical} if canonical else set()
+    for key in ("texto_ocr", "texto_visible", "texto", "contenido_ocr"):
+        value = output.get(key)
+        if isinstance(value, str) and value in seen_texts:
+            output.pop(key, None)
+        elif isinstance(value, str):
+            seen_texts.add(value)
+    return output
 
 
 def _diagnostic(exc: BaseException, *, operation: str) -> dict[str, str]:
@@ -377,7 +486,13 @@ class UniversalInvestigationEngine:
         offset: int = 0,
         maximum_results: int = 20,
         include_pending: bool = True,
+        mode: str = "compacto",
+        include_context: bool = False,
+        maximum_context_characters: int = 800,
     ) -> dict[str, Any]:
+        if mode not in {"compacto", "completo"}:
+            raise ValueError("modo debe ser 'compacto' o 'completo'.")
+        maximum_context_characters = min(max(int(maximum_context_characters), 0), 5000)
         investigation = self.store.require(investigation_id)
         runs = self.store.source_runs(investigation_id)
         source_order = {
@@ -426,6 +541,9 @@ class UniversalInvestigationEngine:
                             *coverage.get("diagnosticos", []),
                             *source_diagnostics,
                         ]
+                    coverage["diagnosticos"] = _deduplicate_diagnostics(
+                        coverage.get("diagnosticos", []), source_name
+                    )
                     for item in source_report.get("evidencias_documentales", []):
                         evidence.append(
                             {
@@ -469,6 +587,9 @@ class UniversalInvestigationEngine:
                         status=run["status"],
                         diagnostics=diagnostics,
                     )
+            coverage["diagnosticos"] = _deduplicate_diagnostics(
+                coverage.get("diagnosticos", []), source_name
+            )
             source_coverage.append(coverage)
 
         runs = self.store.source_runs(investigation_id)
@@ -476,6 +597,65 @@ class UniversalInvestigationEngine:
         pending = (
             pending[offset : offset + maximum_results] if include_pending else []
         )
+        terms = [investigation["target"].name, *investigation["target"].variants]
+        text_budget = (
+            COMPACT_REPORT_TEXT_LIMIT
+            if mode == "compacto"
+            else COMPLETE_REPORT_TEXT_LIMIT
+        )
+        normalised_evidence: list[dict[str, Any]] = []
+        compact_fields = (
+            "fecha", "publicacion", "titulo", "pagina", "fuente", "puntuacion",
+            "categorias", "url_pagina", "url_ocr", "url_imagen",
+            "investigation_id_fuente",
+        )
+        for raw_item in evidence:
+            item = _without_equivalent_ocr_fields(raw_item)
+            full_context = str(item.get("contexto") or "")
+            source_text = full_context or next(
+                (str(item.get(key) or "") for key in ("texto_ocr", "texto_visible") if item.get(key)),
+                "",
+            )
+            categories, facts = _document_facts(source_text)
+            existing_categories = list(item.get("categorias") or [])
+            categories = list(dict.fromkeys([*existing_categories, *categories]))
+            per_item_limit = min(maximum_context_characters, text_budget)
+            fragment = _relevant_fragment(source_text, terms, per_item_limit)
+            text_budget -= len(fragment)
+            if mode == "compacto":
+                result_item = {key: item.get(key) for key in compact_fields}
+                result_item["categorias"] = categories
+                result_item["fragmento_relevante"] = fragment
+                result_item["hechos_extraidos"] = facts
+            else:
+                result_item = item
+                result_item["categorias"] = categories
+                result_item["fragmento_relevante"] = fragment
+                result_item["hechos_extraidos"] = facts
+            if include_context and full_context and text_budget:
+                context = full_context[:text_budget]
+                result_item["contexto"] = context
+                text_budget -= len(context)
+            else:
+                result_item.pop("contexto", None)
+            if mode == "completo":
+                for key in ("texto_ocr", "texto_visible", "texto", "contenido_ocr"):
+                    value = result_item.get(key)
+                    if not isinstance(value, str):
+                        continue
+                    if not text_budget:
+                        result_item.pop(key, None)
+                        continue
+                    result_item[key] = value[:text_budget]
+                    text_budget -= len(result_item[key])
+            normalised_evidence.append(result_item)
+        evidence = normalised_evidence
+        diagnostics_by_source = {
+            run["source_name"]: _deduplicate_diagnostics(
+                run.get("diagnostics", []), run["source_name"]
+            )
+            for run in runs
+        }
         return {
             "investigation_id": investigation_id,
             "persona_objetivo": investigation["target"].name,
@@ -487,9 +667,7 @@ class UniversalInvestigationEngine:
             "evidencias_documentales": evidence,
             "elementos_pendientes": pending,
             "relaciones_familiares_documentadas": relations,
-            "diagnosticos_por_fuente": {
-                run["source_name"]: run.get("diagnostics", []) for run in runs
-            },
+            "diagnosticos_por_fuente": diagnostics_by_source,
             "paginacion": {
                 "desde": offset,
                 "devueltos": len(evidence),

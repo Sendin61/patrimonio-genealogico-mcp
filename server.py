@@ -934,11 +934,17 @@ async def action_universal_investigation_report(request: Request) -> JSONRespons
         investigation_id = str(payload.get("investigation_id") or "").strip()
         if not investigation_id:
             raise ValueError("Falta investigation_id.")
+        maximum_context_characters = int(payload.get("max_caracteres_contexto", 800))
+        if not 0 <= maximum_context_characters <= 5000:
+            raise ValueError("max_caracteres_contexto debe estar entre 0 y 5000.")
         result = get_universal_engine().report(
             investigation_id,
             offset=max(0, int(payload.get("desde", 0))),
             maximum_results=max(1, min(int(payload.get("max_resultados", 20)), 100)),
             include_pending=bool(payload.get("incluir_pendientes", True)),
+            mode=str(payload.get("modo", "compacto")),
+            include_context=bool(payload.get("incluir_contexto", False)),
+            maximum_context_characters=maximum_context_characters,
         )
         return JSONResponse(result)
     except (ValueError, KeyError) as exc:
@@ -1102,6 +1108,11 @@ def _openapi_schema() -> dict[str, Any]:
             "desde": {"type": "integer", "minimum": 0, "default": 0},
             "max_resultados": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
             "incluir_pendientes": {"type": "boolean", "default": True},
+            "modo": {"type": "string", "enum": ["compacto", "completo"], "default": "compacto"},
+            "incluir_contexto": {"type": "boolean", "default": False},
+            "max_caracteres_contexto": {
+                "type": "integer", "minimum": 0, "maximum": 5000, "default": 800
+            },
         },
         "additionalProperties": False,
     }
@@ -1115,6 +1126,99 @@ def _openapi_schema() -> dict[str, Any]:
             "max_caracteres": {"type": "integer", "minimum": 1, "maximum": 30000, "default": 12000},
         },
         "additionalProperties": False,
+    }
+
+    source_summary_schema = {
+        "type": "object",
+        "properties": {
+            "fuente": {"type": "string"},
+            "estado": {"type": "string"},
+            "investigation_id_fuente": {"type": ["string", "null"]},
+            "diagnosticos": {"type": "array", "items": {"type": "object"}},
+        },
+    }
+    universal_responses = {
+        "crearInvestigacion": {
+            "type": "object",
+            "required": ["investigation_id", "persona_objetivo", "estado", "fuentes"],
+            "properties": {
+                "investigation_id": {"type": "string"},
+                "persona_objetivo": {"type": "string"},
+                "estado": {"type": "string"},
+                "fuentes_solicitadas": {"type": "array", "items": {"type": "string"}},
+                "fuentes": {"type": "array", "items": source_summary_schema},
+                "siguiente_paso": {"type": "string"},
+            },
+        },
+        "procesarInvestigacion": {
+            "type": "object",
+            "required": ["investigation_id", "estado", "completada", "fuentes"],
+            "properties": {
+                "investigation_id": {"type": "string"},
+                "estado": {"type": "string"},
+                "completada": {"type": "boolean"},
+                "fuentes": {"type": "array", "items": source_summary_schema},
+                "siguiente_paso": {"type": "string"},
+            },
+        },
+        "obtenerInformeInvestigacion": {
+            "type": "object",
+            "required": ["investigation_id", "estado", "evidencias_documentales", "paginacion"],
+            "properties": {
+                "investigation_id": {"type": "string"},
+                "persona_objetivo": {"type": "string"},
+                "estado": {"type": "string"},
+                "cobertura_por_fuente": {"type": "array", "items": source_summary_schema},
+                "evidencias_documentales": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "fecha": {"type": ["string", "null"]},
+                            "publicacion": {"type": ["string", "null"]},
+                            "titulo": {"type": ["string", "null"]},
+                            "pagina": {"type": ["string", "null"]},
+                            "fuente": {"type": "string"},
+                            "puntuacion": {"type": ["number", "null"]},
+                            "categorias": {"type": "array", "items": {"type": "string"}},
+                            "fragmento_relevante": {"type": "string"},
+                            "contexto": {"type": "string"},
+                            "url_pagina": {"type": ["string", "null"]},
+                            "url_ocr": {"type": ["string", "null"]},
+                            "url_imagen": {"type": ["string", "null"]},
+                            "investigation_id_fuente": {"type": "string"},
+                            "hechos_extraidos": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "required": ["tipo", "valor", "confianza", "texto_soporte"],
+                                    "properties": {
+                                        "tipo": {"type": "string"},
+                                        "valor": {"type": "string"},
+                                        "confianza": {"type": "number", "minimum": 0, "maximum": 1},
+                                        "texto_soporte": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                "elementos_pendientes": {"type": "array", "items": {"type": "object"}},
+                "relaciones_familiares_documentadas": {"type": "array", "items": {"type": "object"}},
+                "diagnosticos_por_fuente": {"type": "object"},
+                "paginacion": {"type": "object"},
+            },
+        },
+        "leerFuenteInvestigacion": {
+            "type": "object",
+            "properties": {
+                "fuente": {"type": "string"},
+                "source_url": {"type": "string"},
+                "content": {"type": "string"},
+                "contextos": {"type": "array", "items": {"type": "string"}},
+                "documento": {"type": "object"},
+            },
+        },
     }
 
     def operation(operation_id: str, summary: str, description: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -1134,7 +1238,7 @@ def _openapi_schema() -> dict[str, Any]:
                         "description": "Operación completada.",
                         "content": {
     "application/json": {
-        "schema": {
+        "schema": universal_responses.get(operation_id, {
             "type": "object",
             "properties": {
                 "estado": {
@@ -1151,7 +1255,7 @@ def _openapi_schema() -> dict[str, Any]:
                 },
             },
             "additionalProperties": True,
-        }
+        })
     }
 },
                     },

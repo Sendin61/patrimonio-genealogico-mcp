@@ -127,6 +127,17 @@ def test_openapi_declares_action_key_without_changing_operation_ids(monkeypatch)
     assert new_ids <= operation_ids
     assert operation_ids == old_ids | new_ids
     assert all(operation["security"] == [{"RobActionKey": []}] for operation in operations)
+    for operation_id in new_ids:
+        operation = next(item for item in operations if item["operationId"] == operation_id)
+        response = operation["responses"]["200"]["content"]["application/json"][
+            "schema"
+        ]
+        assert response.get("required") or len(response.get("properties", {})) >= 5
+
+    report_request = schema["paths"]["/api/investigacion/informe"]["post"][
+        "requestBody"
+    ]["content"]["application/json"]["schema"]
+    assert report_request["properties"]["modo"]["enum"] == ["compacto", "completo"]
 
 
 def test_secret_never_appears_in_responses_or_logs(monkeypatch, caplog) -> None:
