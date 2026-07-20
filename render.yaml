@@ -5,5 +5,7 @@ services:
     plan: free
     autoDeploy: true
     envVars:
+      - key: DATABASE_URL
+        sync: false
       - key: EUROPEANA_API_KEY
         sync: false
