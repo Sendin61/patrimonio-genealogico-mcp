@@ -14,6 +14,17 @@ from .store import UniversalInvestigationStore
 TERMINAL_SOURCE_STATUSES = {"complete", "failed"}
 COMPACT_REPORT_TEXT_LIMIT = 50_000
 COMPLETE_REPORT_TEXT_LIMIT = 200_000
+LOCAL_WINDOW_RADIUS = 240
+MAX_FACT_SUPPORT_CHARACTERS = 320
+
+_STRUCTURAL_TEXT_FIELDS = {
+    "fecha",
+    "publicacion",
+    "titulo",
+    "pagina",
+    "fuente",
+    "investigation_id_fuente",
+}
 
 _DOCUMENT_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("nombramiento", ("nombrado", "nombramiento", "designado")),
@@ -36,22 +47,80 @@ def _normalise_text(value: str) -> str:
     )
 
 
-def _indicator_position(text: str, indicator: str) -> int:
-    match = re.search(
-        rf"(?<!\w){re.escape(_normalise_text(indicator))}(?!\w)",
-        _normalise_text(text),
-    )
-    return match.start() if match else -1
+def _normalise_with_index_map(value: str) -> tuple[str, list[int]]:
+    normalised: list[str] = []
+    original_indexes: list[int] = []
+    for original_index, character in enumerate(value):
+        for folded in unicodedata.normalize("NFKD", character.casefold()):
+            if unicodedata.combining(folded):
+                continue
+            normalised.append(folded)
+            original_indexes.append(original_index)
+    return "".join(normalised), original_indexes
+
+
+def _original_matches(text: str, terms: Iterable[str]) -> list[tuple[int, int]]:
+    normalised, index_map = _normalise_with_index_map(text)
+    matches: list[tuple[int, int]] = []
+    for term in terms:
+        needle = _normalise_text(str(term).strip())
+        if not needle:
+            continue
+        for match in re.finditer(rf"(?<!\w){re.escape(needle)}(?!\w)", normalised):
+            start = index_map[match.start()]
+            end = index_map[match.end() - 1] + 1
+            matches.append((start, end))
+    return sorted(set(matches))
+
+
+def _local_windows(text: str, terms: list[str]) -> list[str]:
+    windows: list[str] = []
+    for name_start, name_end in _original_matches(text, terms):
+        lower = max(0, name_start - LOCAL_WINDOW_RADIUS)
+        upper = min(len(text), name_end + LOCAL_WINDOW_RADIUS)
+        prefix = text[lower:name_start]
+        suffix = text[name_end:upper]
+        left_delimiters = [
+            match.end() for match in re.finditer(r"[.!?;\r\n]", prefix)
+        ]
+        right_delimiter = re.search(r"[.!?;\r\n]", suffix)
+        start = lower + (left_delimiters[-1] if left_delimiters else 0)
+        end = name_end + (
+            right_delimiter.start() if right_delimiter else len(suffix)
+        )
+        window = text[start:end].strip()
+        if window and window not in windows:
+            windows.append(window)
+    return windows
+
+
+def _fact_support(window: str, terms: list[str], indicator: str) -> str | None:
+    name_matches = _original_matches(window, terms)
+    indicator_matches = _original_matches(window, [indicator])
+    candidates: list[tuple[int, int]] = []
+    for name_start, name_end in name_matches:
+        for indicator_start, indicator_end in indicator_matches:
+            candidates.append(
+                (min(name_start, indicator_start), max(name_end, indicator_end))
+            )
+    if not candidates:
+        return None
+    core_start, core_end = min(candidates, key=lambda span: span[1] - span[0])
+    if core_end - core_start > MAX_FACT_SUPPORT_CHARACTERS:
+        return None
+    padding = MAX_FACT_SUPPORT_CHARACTERS - (core_end - core_start)
+    start = max(0, core_start - padding // 2)
+    end = min(len(window), start + MAX_FACT_SUPPORT_CHARACTERS)
+    start = max(0, end - MAX_FACT_SUPPORT_CHARACTERS)
+    return window[start:end].strip()
 
 
 def _relevant_fragment(text: str, terms: list[str], maximum: int) -> str:
     text = str(text or "").strip()
     if maximum <= 0 or not text:
         return ""
-    normalised = _normalise_text(text)
-    positions = [normalised.find(_normalise_text(term)) for term in terms if term.strip()]
-    positions = [position for position in positions if position >= 0]
-    centre = min(positions) if positions else 0
+    matches = _original_matches(text, terms)
+    centre = matches[0][0] if matches else 0
     start = max(0, centre - maximum // 2)
     end = min(len(text), start + maximum)
     start = max(0, end - maximum)
@@ -82,30 +151,87 @@ def _deduplicate_diagnostics(
     return output
 
 
-def _document_facts(text: str) -> tuple[list[str], list[dict[str, Any]]]:
+def _document_facts(
+    text: str, terms: list[str]
+) -> tuple[list[str], list[dict[str, Any]]]:
     categories: list[str] = []
     facts: list[dict[str, Any]] = []
-    for category, indicators in _DOCUMENT_RULES:
-        matched = next(
-            (indicator for indicator in indicators if _indicator_position(text, indicator) >= 0),
-            None,
-        )
-        if matched is None:
+    seen: set[tuple[str, str, str]] = set()
+    for window in _local_windows(text, terms):
+        if not _original_matches(window, terms):
             continue
-        categories.append(category)
-        position = _indicator_position(text, matched)
-        support = text[max(0, position - 90) : position + len(matched) + 90].strip()
-        facts.append(
-            {
-                "tipo": category,
-                "valor": matched,
-                "confianza": 0.8,
-                "texto_soporte": support,
-            }
-        )
-    if not categories:
-        categories.append("mención nominal")
+        for category, indicators in _DOCUMENT_RULES:
+            matched = next(
+                (
+                    indicator
+                    for indicator in indicators
+                    if _original_matches(window, [indicator])
+                ),
+                None,
+            )
+            if matched is None:
+                continue
+            support = _fact_support(window, terms, matched)
+            if support is None:
+                continue
+            key = (category, matched, support)
+            if key in seen:
+                continue
+            seen.add(key)
+            categories.append(category)
+            facts.append(
+                {
+                    "tipo": category,
+                    "valor": matched,
+                    "confianza": 0.8,
+                    "texto_soporte": support,
+                }
+            )
     return categories, facts
+
+
+def _is_structural_text(key: str) -> bool:
+    return (
+        key in _STRUCTURAL_TEXT_FIELDS
+        or key == "categorias"
+        or key.startswith("url_")
+        or key == "id"
+        or key.endswith("_id")
+    )
+
+
+def _limit_evidence_text(
+    value: Any,
+    remaining: int,
+    *,
+    key: str = "",
+) -> tuple[Any, int, bool]:
+    if isinstance(value, str):
+        if _is_structural_text(key):
+            return value, remaining, False
+        allowed = min(len(value), remaining)
+        return value[:allowed], remaining - allowed, allowed < len(value)
+    if isinstance(value, list):
+        output: list[Any] = []
+        truncated = False
+        for item in value:
+            limited, remaining, item_truncated = _limit_evidence_text(
+                item, remaining, key=key
+            )
+            output.append(limited)
+            truncated = truncated or item_truncated
+        return output, remaining, truncated
+    if isinstance(value, dict):
+        output: dict[str, Any] = {}
+        truncated = False
+        for child_key, item in value.items():
+            limited, remaining, item_truncated = _limit_evidence_text(
+                item, remaining, key=str(child_key)
+            )
+            output[child_key] = limited
+            truncated = truncated or item_truncated
+        return output, remaining, truncated
+    return value, remaining, False
 
 
 def _without_equivalent_ocr_fields(item: dict[str, Any]) -> dict[str, Any]:
@@ -603,6 +729,8 @@ class UniversalInvestigationEngine:
             if mode == "compacto"
             else COMPLETE_REPORT_TEXT_LIMIT
         )
+        text_limit = text_budget
+        text_truncated = False
         normalised_evidence: list[dict[str, Any]] = []
         compact_fields = (
             "fecha", "publicacion", "titulo", "pagina", "fuente", "puntuacion",
@@ -613,15 +741,27 @@ class UniversalInvestigationEngine:
             item = _without_equivalent_ocr_fields(raw_item)
             full_context = str(item.get("contexto") or "")
             source_text = full_context or next(
-                (str(item.get(key) or "") for key in ("texto_ocr", "texto_visible") if item.get(key)),
+                (
+                    str(item.get(key) or "")
+                    for key in (
+                        "texto_ocr",
+                        "texto_visible",
+                        "texto",
+                        "contenido_ocr",
+                    )
+                    if item.get(key)
+                ),
                 "",
             )
-            categories, facts = _document_facts(source_text)
+            inferred_categories, facts = _document_facts(source_text, terms)
             existing_categories = list(item.get("categorias") or [])
-            categories = list(dict.fromkeys([*existing_categories, *categories]))
-            per_item_limit = min(maximum_context_characters, text_budget)
+            categories = list(
+                dict.fromkeys([*existing_categories, *inferred_categories])
+            )
+            if not categories:
+                categories = ["mención nominal"]
+            per_item_limit = maximum_context_characters
             fragment = _relevant_fragment(source_text, terms, per_item_limit)
-            text_budget -= len(fragment)
             if mode == "compacto":
                 result_item = {key: item.get(key) for key in compact_fields}
                 result_item["categorias"] = categories
@@ -632,22 +772,14 @@ class UniversalInvestigationEngine:
                 result_item["categorias"] = categories
                 result_item["fragmento_relevante"] = fragment
                 result_item["hechos_extraidos"] = facts
-            if include_context and full_context and text_budget:
-                context = full_context[:text_budget]
-                result_item["contexto"] = context
-                text_budget -= len(context)
+            if include_context and full_context:
+                result_item["contexto"] = full_context
             else:
                 result_item.pop("contexto", None)
-            if mode == "completo":
-                for key in ("texto_ocr", "texto_visible", "texto", "contenido_ocr"):
-                    value = result_item.get(key)
-                    if not isinstance(value, str):
-                        continue
-                    if not text_budget:
-                        result_item.pop(key, None)
-                        continue
-                    result_item[key] = value[:text_budget]
-                    text_budget -= len(result_item[key])
+            result_item, text_budget, item_truncated = _limit_evidence_text(
+                result_item, text_budget
+            )
+            text_truncated = text_truncated or item_truncated
             normalised_evidence.append(result_item)
         evidence = normalised_evidence
         diagnostics_by_source = {
@@ -668,6 +800,8 @@ class UniversalInvestigationEngine:
             "elementos_pendientes": pending,
             "relaciones_familiares_documentadas": relations,
             "diagnosticos_por_fuente": diagnostics_by_source,
+            "texto_truncado": text_truncated,
+            "limite_texto": text_limit,
             "paginacion": {
                 "desde": offset,
                 "devueltos": len(evidence),

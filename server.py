@@ -1207,6 +1207,8 @@ def _openapi_schema() -> dict[str, Any]:
                 "relaciones_familiares_documentadas": {"type": "array", "items": {"type": "object"}},
                 "diagnosticos_por_fuente": {"type": "object"},
                 "paginacion": {"type": "object"},
+                "texto_truncado": {"type": "boolean"},
+                "limite_texto": {"type": "integer"},
             },
         },
         "leerFuenteInvestigacion": {
