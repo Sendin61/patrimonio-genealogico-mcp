@@ -2,7 +2,7 @@
 
 Servidor MCP para búsquedas genealógicas en bibliotecas, archivos y hemerotecas digitales.
 
-## Versión 0.8.0
+## Versión 0.9.0
 
 Incluye:
 
@@ -64,8 +64,15 @@ curl -X POST "$ROB_URL/api/investigacion/informe" \
   -d '{"investigation_id":"ID_UNIVERSAL","max_resultados":20}'
 ```
 
-Exa, Firecrawl, FamilySearch y otras fuentes se incorporarán en fases posteriores
-mediante nuevos adaptadores; esta versión no realiza llamadas a esos servicios.
+Exa puede solicitarse explícitamente con `"fuentes":["galiciana","exa"]`. Es una
+búsqueda web general: no equivale a un registro civil ni constituye por sí sola una
+prueba genealógica. Sus resultados pueden ser fuentes primarias, secundarias o simples
+referencias; cada hallazgo conserva su URL y texto de soporte para poder auditarlo.
+
+Configura `EXA_API_KEY` como secreto en Render para habilitarla. Sin esa variable el
+servidor sigue arrancando y las investigaciones continúan limitadas a Galiciana. Los
+límites opcionales `EXA_MAX_RESULTS_PER_INVESTIGATION` y
+`EXA_MAX_QUERIES_PER_INVESTIGATION` tienen valores predeterminados 40 y 6.
 
 ## Próximas fuentes
 

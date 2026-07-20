@@ -43,7 +43,10 @@ def test_public_routes_do_not_require_action_key(monkeypatch) -> None:
         "rutas_operativas_protegidas": True,
     }
     assert health["motor_universal"] is True
-    assert health["version"] == http.get("/openapi.json").json()["info"]["version"] == "0.8.0"
+    assert health["motor_multifuente"] is True
+    assert health["exa_configurada"] is False
+    assert health["fuentes_universales_disponibles"] == ["galiciana"]
+    assert health["version"] == http.get("/openapi.json").json()["info"]["version"] == "0.9.0"
 
 
 def test_api_returns_503_when_server_key_is_not_configured(monkeypatch) -> None:

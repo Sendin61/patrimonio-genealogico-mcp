@@ -25,6 +25,8 @@ from rob.connectors.oai_pmh import (
 from rob.models import GenealogyQuery
 from rob.galiciana_investigations import get_default_engine
 from rob.investigations import (
+    ExaInvestigationStore,
+    ExaSourceAdapter,
     GalicianaSourceAdapter,
     InvestigationTarget,
     UniversalInvestigationEngine,
@@ -274,9 +276,10 @@ def get_universal_engine() -> UniversalInvestigationEngine:
     """Build a stateless coordinator over the persisted, existing Galiciana engine."""
     galiciana_engine = get_default_engine()
     store = UniversalInvestigationStore(database=galiciana_engine.store)
+    exa_store = ExaInvestigationStore(database=galiciana_engine.store)
     return UniversalInvestigationEngine(
         store,
-        [GalicianaSourceAdapter(galiciana_engine)],
+        [GalicianaSourceAdapter(galiciana_engine), ExaSourceAdapter(exa_store)],
     )
 
 
@@ -284,11 +287,17 @@ def get_universal_engine() -> UniversalInvestigationEngine:
 def estado() -> dict[str, Any]:
     """Muestra la versión y el estado declarado de las fuentes."""
     storage = get_default_engine().store.storage_status()
+    available_sources = ["galiciana"]
+    if os.getenv("EXA_API_KEY", "").strip():
+        available_sources.append("exa")
     return {
         "servidor": "Rob — Metabuscador Genealógico",
         "version": SERVICE_VERSION,
         "resumen_fuentes": source_summary(),
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
+        "exa_configurada": bool(os.getenv("EXA_API_KEY", "").strip()),
+        "fuentes_universales_disponibles": available_sources,
+        "motor_multifuente": True,
         "actions_configuradas": True,
         "almacenamiento": storage,
         "seguridad": _security_status(),
@@ -649,6 +658,9 @@ async def abrir_registro_europeana(record_id: str) -> dict[str, Any]:
 async def health_route(request: Request) -> JSONResponse:
     del request
     storage = get_default_engine().store.storage_status()
+    available_sources = ["galiciana"]
+    if os.getenv("EXA_API_KEY", "").strip():
+        available_sources.append("exa")
     return JSONResponse(
         {
             "ok": True,
@@ -658,6 +670,9 @@ async def health_route(request: Request) -> JSONResponse:
             "openapi": f"{PUBLIC_BASE_URL}/openapi.json",
             "motor_expedientes": True,
             "motor_universal": True,
+            "motor_multifuente": True,
+            "exa_configurada": bool(os.getenv("EXA_API_KEY", "").strip()),
+            "fuentes_universales_disponibles": available_sources,
             "persistencia": storage,
             "seguridad": _security_status(),
         }
@@ -1076,7 +1091,7 @@ def _openapi_schema() -> dict[str, Any]:
             "profesion": {"type": "string", "default": ""},
             "fuentes": {
                 "type": "array",
-                "items": {"type": "string", "enum": ["galiciana"]},
+                "items": {"type": "string", "enum": ["galiciana", "exa"]},
                 "default": ["galiciana"],
             },
             "max_consultas": {"type": "integer", "minimum": 1, "maximum": 10, "default": 8},
@@ -1120,7 +1135,7 @@ def _openapi_schema() -> dict[str, Any]:
         "type": "object",
         "required": ["fuente", "url"],
         "properties": {
-            "fuente": {"type": "string", "enum": ["galiciana"]},
+            "fuente": {"type": "string", "enum": ["galiciana", "exa"]},
             "url": {"type": "string", "format": "uri"},
             "terminos": {"type": "array", "items": {"type": "string"}, "default": []},
             "max_caracteres": {"type": "integer", "minimum": 1, "maximum": 30000, "default": 12000},

@@ -354,14 +354,18 @@ class UniversalInvestigationEngine:
                 )
 
         status = self._refresh_status(investigation_id)
+        run_by_name = {
+            run["source_name"]: run
+            for run in self.store.source_runs(investigation_id)
+        }
         return {
             "investigation_id": investigation_id,
             "persona_objetivo": target.name,
             "estado": status,
             "fuentes_solicitadas": sources,
             "fuentes": [
-                self._source_summary(run)
-                for run in self.store.source_runs(investigation_id)
+                self._source_summary(run_by_name[source_name])
+                for source_name in sources
             ],
             "siguiente_paso": (
                 "Llama a procesarInvestigacion."
