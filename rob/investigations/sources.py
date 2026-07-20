@@ -259,12 +259,19 @@ class GalicianaSourceAdapter:
         ):
             full_text = str(row.get("full_text") or "")
             current_context = str(evidence.get("contexto") or "")
-            if (
-                full_text
-                and terms
-                and _contains_target(full_text, terms)
-                and not _contains_target(current_context, terms)
-            ):
+            if not terms or not (full_text or current_context):
+                continue
+
+            full_text_contains_target = _contains_target(full_text, terms)
+            current_context_contains_target = _contains_target(current_context, terms)
+            verified = full_text_contains_target or current_context_contains_target
+            evidence["coincidencia_verificada"] = verified
+
+            if not verified:
+                evidence["puntuacion"] = 0.0
+                evidence["categorias"] = ["resultado de búsqueda no verificado"]
+                evidence["contexto"] = ""
+            elif full_text_contains_target and not current_context_contains_target:
                 evidence["contexto"] = full_text
 
         report["diagnosticos_fuente"] = self._diagnostics(source_investigation_id)
