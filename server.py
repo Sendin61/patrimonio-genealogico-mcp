@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import re
 import unicodedata
@@ -11,6 +12,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rob.connectors.galiciana_bdg import GalicianaBDGConnector
 from rob.connectors.galiciana_ocr import GalicianaOCRConnector
@@ -34,7 +36,70 @@ PUBLIC_BASE_URL = os.getenv(
     "https://patrimonio-genealogico-mcp.onrender.com",
 ).strip().rstrip("/")
 
-mcp = FastMCP(
+
+def _action_key() -> str:
+    return os.getenv("ROB_ACTION_KEY", "").strip()
+
+
+def _security_status() -> dict[str, bool]:
+    return {
+        "autenticacion_configurada": bool(_action_key()),
+        "rutas_operativas_protegidas": True,
+    }
+
+
+class RobActionKeyMiddleware:
+    """Protect all operational HTTP traffic before it reaches FastMCP routes."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    @staticmethod
+    def _protected(path: str) -> bool:
+        return (
+            path == "/api"
+            or path.startswith("/api/")
+            or path == "/mcp"
+            or path.startswith("/mcp/")
+        )
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("method") == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
+        path = str(scope.get("path") or "")
+        if not self._protected(path):
+            await self.app(scope, receive, send)
+            return
+
+        expected = _action_key()
+        if not expected:
+            await JSONResponse(
+                {"error": "Servicio no disponible."}, status_code=503
+            )(scope, receive, send)
+            return
+
+        supplied = b""
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"x-rob-key":
+                supplied = value.strip()
+                break
+        if not supplied or not hmac.compare_digest(supplied, expected.encode("utf-8")):
+            await JSONResponse({"error": "No autorizado."}, status_code=401)(
+                scope, receive, send
+            )
+            return
+
+        await self.app(scope, receive, send)
+
+
+class RobFastMCP(FastMCP):
+    def streamable_http_app(self) -> ASGIApp:
+        return RobActionKeyMiddleware(super().streamable_http_app())
+
+
+mcp = RobFastMCP(
     "Rob — Metabuscador Genealógico",
     host="0.0.0.0",
     port=int(os.getenv("PORT", "8000")),
@@ -196,6 +261,7 @@ def estado() -> dict[str, Any]:
         "europeana_configurada": bool(os.getenv("EUROPEANA_API_KEY", "").strip()),
         "actions_configuradas": True,
         "almacenamiento": storage,
+        "seguridad": _security_status(),
         "nota": "development no significa verificado; la prueba real se hace contra cada portal.",
     }
 
@@ -562,6 +628,7 @@ async def health_route(request: Request) -> JSONResponse:
             "openapi": f"{PUBLIC_BASE_URL}/openapi.json",
             "motor_expedientes": True,
             "persistencia": storage,
+            "seguridad": _security_status(),
         }
     )
 
@@ -834,6 +901,7 @@ def _openapi_schema() -> dict[str, Any]:
         return {
             "post": {
                 "operationId": operation_id,
+                "security": [{"RobActionKey": []}],
                 "summary": summary,
                 "description": description,
                 "x-openai-isConsequential": False,
@@ -884,6 +952,15 @@ def _openapi_schema() -> dict[str, Any]:
             "version": "0.7.0",
         },
         "servers": [{"url": PUBLIC_BASE_URL}],
+        "components": {
+            "securitySchemes": {
+                "RobActionKey": {
+                    "type": "apiKey",
+                    "in": "header",
+                    "name": "X-ROB-Key",
+                }
+            }
+        },
         "paths": {
             "/api/galiciana/investigaciones/crear": operation(
                 "crearInvestigacionGaliciana",

@@ -5,6 +5,8 @@ services:
     plan: free
     autoDeploy: true
     envVars:
+      - key: ROB_ACTION_KEY
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: EUROPEANA_API_KEY
