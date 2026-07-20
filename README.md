@@ -2,7 +2,7 @@
 
 Servidor MCP para búsquedas genealógicas en bibliotecas, archivos y hemerotecas digitales.
 
-## Versión 0.9.0
+## Versión 1.0.0
 
 Incluye:
 
@@ -37,8 +37,10 @@ o en `almacenamiento.backend` de la herramienta `estado`.
 
 Un **expediente universal** es el identificador estable que coordina una investigación
 completa. Cada fuente mantiene además su propia **investigación hija**, con un
-identificador interno independiente para conservar la trazabilidad. Galiciana es la
-primera fuente adaptada. Los `investigation_id` creados por las rutas antiguas de
+identificador interno independiente para conservar la trazabilidad. ROB 1.0 dispone
+de Galiciana y Exa. El procesamiento es persistente y reanudable: ambas fuentes pueden
+procesarse juntas o filtrarse individualmente, y el fallo de una no invalida el trabajo
+ya conservado por la otra. Los `investigation_id` creados por las rutas antiguas de
 Galiciana siguen siendo válidos y no se migran ni se copian.
 
 Las rutas generales son:
@@ -73,6 +75,12 @@ Configura `EXA_API_KEY` como secreto en Render para habilitarla. Sin esa variabl
 servidor sigue arrancando y las investigaciones continúan limitadas a Galiciana. Los
 límites opcionales `EXA_MAX_RESULTS_PER_INVESTIGATION` y
 `EXA_MAX_QUERIES_PER_INVESTIGATION` tienen valores predeterminados 40 y 6.
+
+En los informes, los fragmentos de Galiciana se centran alrededor de la mejor
+coincidencia del nombre, sus variantes o las consultas guardadas, conservando
+literalmente el OCR original. La extracción estructurada automática de hechos o
+parentescos no forma parte del alcance de ROB 1.0: los hallazgos deben revisarse en su
+fuente y texto de soporte.
 
 ## Próximas fuentes
 
