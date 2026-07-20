@@ -69,6 +69,17 @@ def _status_for_error(exc: BaseException, attempts: int) -> str:
     return "retryable" if retryable and attempts < 3 else "failed"
 
 
+def _individual_error(status: dict[str, Any]) -> ExaAPIError:
+    error = status.get("error") if isinstance(status.get("error"), dict) else {}
+    tag = str(error.get("tag") or status.get("status") or "error")[:100]
+    code = error.get("httpStatusCode")
+    status_code = code if isinstance(code, int) else None
+    suffix = f" HTTP {status_code}" if status_code is not None else ""
+    return ExaAPIError(
+        f"Exa no pudo leer el recurso: {tag}{suffix}.", status_code=status_code
+    )
+
+
 def _safe_url(value: str) -> str:
     parts = urlsplit(value.strip())
     if parts.scheme not in {"http", "https"} or not parts.hostname or parts.username or parts.password:
@@ -220,11 +231,24 @@ class ExaSourceAdapter:
                     _canonical_url(item["url"]): item
                     for item in response["results"] if item.get("url")
                 }
+                statuses: dict[str, dict[str, Any]] = {}
+                for status_item in response.get("statuses", []):
+                    identifier = status_item.get("id") or status_item.get("url")
+                    if identifier:
+                        statuses[_canonical_url(str(identifier))] = status_item
                 for item in claimed:
                     data = returned.get(item["canonical_url"])
                     if data is None:
-                        status = "retryable" if item["attempts"] < 3 else "failed"
-                        self.store.mark(item["id"], status=status, error="Exa omitió la URL reclamada.")
+                        individual = statuses.get(item["canonical_url"])
+                        error = (
+                            _individual_error(individual)
+                            if individual is not None
+                            else ExaAPIError("Exa omitió la URL reclamada.")
+                        )
+                        status = _status_for_error(error, item["attempts"])
+                        self.store.mark(
+                            item["id"], status=status, error=str(error)[:300]
+                        )
                         failed += status == "failed"
                     else:
                         remaining_text = 8000
@@ -309,8 +333,28 @@ class ExaSourceAdapter:
         response = await self.client.contents(
             [source_url], highlight_query=" ".join(terms) or source_url, max_characters=min(maximum, 8000)
         )
-        result = next((item for item in response["results"] if item.get("url")), None)
+        requested = _canonical_url(source_url)
+        result = next(
+            (
+                item
+                for item in response["results"]
+                if item.get("url") and _canonical_url(item["url"]) == requested
+            ),
+            None,
+        )
         if result is None:
+            status = next(
+                (
+                    item
+                    for item in response.get("statuses", [])
+                    if (item.get("id") or item.get("url"))
+                    and _canonical_url(str(item.get("id") or item.get("url")))
+                    == requested
+                ),
+                None,
+            )
+            if status is not None:
+                raise _individual_error(status)
             raise ExaAPIError("Exa no devolvió el documento solicitado.")
         remaining = maximum
         contexts: list[str] = []

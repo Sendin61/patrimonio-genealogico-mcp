@@ -94,16 +94,16 @@ class ExaClient:
         highlight_query: str,
         max_characters: int,
     ) -> dict[str, Any]:
+        bounded_maximum = min(max(max_characters, 1), 8000)
         data = await self._post(
             "/contents",
             {
                 "ids": urls[:80],
                 "highlights": {
                     "query": highlight_query[:2000],
-                    "numSentences": 3,
-                    "highlightsPerUrl": 5,
+                    "maxCharacters": bounded_maximum,
                 },
-                "text": {"maxCharacters": min(max(max_characters, 1), 8000)},
+                "text": {"maxCharacters": bounded_maximum},
             },
         )
         results: list[dict[str, Any]] = []
@@ -126,4 +126,33 @@ class ExaClient:
                     "text": _bounded(raw.get("text"), 8000),
                 }
             )
-        return {"results": results, "diagnostics": self._diagnostics(data)}
+        statuses: list[dict[str, Any]] = []
+        raw_statuses = data.get("statuses", [])
+        if isinstance(raw_statuses, list):
+            for raw in raw_statuses[:80]:
+                if not isinstance(raw, dict):
+                    continue
+                status: dict[str, Any] = {}
+                identifier = raw.get("id")
+                if identifier is not None:
+                    status["id"] = _bounded(identifier, 4000)
+                elif raw.get("url") is not None:
+                    status["url"] = _bounded(raw.get("url"), 4000)
+                if isinstance(raw.get("status"), (str, int)):
+                    status["status"] = raw["status"]
+                error = raw.get("error")
+                if isinstance(error, dict):
+                    compact_error: dict[str, Any] = {}
+                    if isinstance(error.get("tag"), (str, int)):
+                        compact_error["tag"] = _bounded(error["tag"], 100)
+                    if isinstance(error.get("httpStatusCode"), int):
+                        compact_error["httpStatusCode"] = error["httpStatusCode"]
+                    if compact_error:
+                        status["error"] = compact_error
+                if status:
+                    statuses.append(status)
+        return {
+            "results": results,
+            "statuses": statuses,
+            "diagnostics": self._diagnostics(data),
+        }

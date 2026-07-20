@@ -43,10 +43,27 @@ async def test_exa_client_uses_headers_endpoints_bounds_and_accepts_extra_fields
             )
         assert request.url.path == "/contents"
         assert payload["ids"] == ["https://example.org/a"]
+        assert payload["highlights"] == {
+            "query": "persona",
+            "maxCharacters": 8000,
+        }
+        assert payload["text"] == {"maxCharacters": 8000}
+        assert "numSentences" not in payload["highlights"]
+        assert "highlightsPerUrl" not in payload["highlights"]
         return httpx.Response(
             200,
             json={
                 "results": [{"url": "https://example.org/a", "highlights": ["H" * 3000], "text": "T" * 9000}],
+                "statuses": [{
+                    "id": "https://example.org/missing",
+                    "status": "error",
+                    "error": {
+                        "tag": "NOT_FOUND",
+                        "httpStatusCode": 404,
+                        "message": "secret-exa-key and a long upstream body",
+                    },
+                    "unknown": "secret-exa-key",
+                }],
                 "extra": True,
             },
         )
@@ -61,6 +78,11 @@ async def test_exa_client_uses_headers_endpoints_bounds_and_accepts_extra_fields
     assert search["diagnostics"] == {"requestId": "request-1", "costDollars": 0.01}
     assert len(contents["results"][0]["highlights"][0]) == 1600
     assert len(contents["results"][0]["text"]) == 8000
+    assert contents["statuses"] == [{
+        "id": "https://example.org/missing",
+        "status": "error",
+        "error": {"tag": "NOT_FOUND", "httpStatusCode": 404},
+    }]
     assert "secret-exa-key" not in repr(search) + repr(contents)
 
 
@@ -228,6 +250,103 @@ async def test_processing_classifies_http_errors(tmp_path, status_code, expected
     )
     await adapter.process_next_batch(created["source_investigation_id"], batch_size=1, time_budget_seconds=10)
     assert adapter.store.rows(created["source_investigation_id"], 0, 1)[0]["status"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status_code,expected", [(404, "failed"), (403, "failed"), (504, "retryable")]
+)
+async def test_processing_classifies_individual_content_statuses(
+    tmp_path, status_code, expected
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            return httpx.Response(
+                200, json={"results": [{"url": "https://example.org/a"}]}
+            )
+        return httpx.Response(200, json={
+            "results": [],
+            "statuses": [{
+                "id": "https://example.org/a",
+                "status": "error",
+                "error": {"tag": "UPSTREAM", "httpStatusCode": status_code},
+            }],
+        })
+
+    adapter = ExaSourceAdapter(
+        ExaInvestigationStore(str(tmp_path / f"individual-{status_code}.sqlite3")),
+        api_key="key",
+        client=client(handler, "key"),
+    )
+    created = await adapter.create_investigation(
+        InvestigationTarget(name="Persona"), maximum_queries=1, maximum_results=1
+    )
+    await adapter.process_next_batch(
+        created["source_investigation_id"], batch_size=1, time_budget_seconds=10
+    )
+    row = adapter.store.rows(created["source_investigation_id"], 0, 1)[0]
+    assert row["status"] == expected
+    assert "UPSTREAM" in row["error"] and str(status_code) in row["error"]
+
+
+@pytest.mark.asyncio
+async def test_individual_retryable_status_fails_after_three_attempts(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search":
+            return httpx.Response(
+                200, json={"results": [{"url": "https://example.org/a"}]}
+            )
+        return httpx.Response(200, json={
+            "results": [],
+            "statuses": [{
+                "url": "https://example.org/a",
+                "error": {"tag": "TIMEOUT", "httpStatusCode": 504},
+            }],
+        })
+
+    adapter = ExaSourceAdapter(
+        ExaInvestigationStore(str(tmp_path / "individual-retry.sqlite3")),
+        api_key="key",
+        client=client(handler, "key"),
+    )
+    created = await adapter.create_investigation(
+        InvestigationTarget(name="Persona"), maximum_queries=1, maximum_results=1
+    )
+    for _ in range(3):
+        await adapter.process_next_batch(
+            created["source_investigation_id"], batch_size=1, time_budget_seconds=10
+        )
+    assert adapter.store.rows(created["source_investigation_id"], 0, 1)[0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_read_source_raises_safe_individual_status(tmp_path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "results": [],
+            "statuses": [{
+                "id": "https://example.org/direct",
+                "status": "error",
+                "error": {
+                    "tag": "FORBIDDEN",
+                    "httpStatusCode": 403,
+                    "message": "secret-exa-key must not escape",
+                },
+            }],
+        })
+
+    adapter = ExaSourceAdapter(
+        ExaInvestigationStore(str(tmp_path / "direct-status.sqlite3")),
+        api_key="secret-exa-key",
+        client=client(handler),
+    )
+    with pytest.raises(ExaAPIError) as caught:
+        await adapter.read_source(
+            "https://example.org/direct", terms=["Persona"], maximum_characters=100
+        )
+    assert caught.value.status_code == 403
+    assert "FORBIDDEN" in str(caught.value)
+    assert "secret-exa-key" not in str(caught.value)
 
 
 @pytest.mark.asyncio
