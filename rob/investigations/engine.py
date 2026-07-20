@@ -157,6 +157,39 @@ class UniversalInvestigationEngine:
             diagnostics=[],
         )
 
+    def _mark_budget_exhausted(
+        self,
+        investigation_id: str,
+        runs: list[dict[str, Any]],
+        *,
+        first_source_started: bool,
+    ) -> list[dict[str, Any]]:
+        updates: list[tuple[str, str, list[dict[str, Any]]]] = []
+        for index, run in enumerate(runs):
+            started = first_source_started and index == 0
+            operation = (
+                "presupuesto_agotado"
+                if started
+                else "presupuesto_agotado_antes_de_iniciar"
+            )
+            message = (
+                "Presupuesto global agotado durante la fuente."
+                if started
+                else "Presupuesto global agotado antes de iniciar la fuente."
+            )
+            updates.append(
+                (
+                    run["source_name"],
+                    "pending",
+                    [
+                        *run.get("diagnostics", []),
+                        _diagnostic(TimeoutError(message), operation=operation),
+                    ],
+                )
+            )
+        updated = self.store.update_runs(investigation_id, updates)
+        return [self._source_summary(updated[run["source_name"]]) for run in runs]
+
     async def process(
         self,
         investigation_id: str,
@@ -165,6 +198,9 @@ class UniversalInvestigationEngine:
         time_budget_seconds: int = 50,
         sources: list[str] | None = None,
     ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        budget = min(max(float(time_budget_seconds), 0.0), 55.0)
+        deadline = loop.time() + budget
         investigation = self.store.require(investigation_id)
         requested = list(investigation["requested_sources"])
         selected = self.validate_sources(sources or [])
@@ -182,15 +218,23 @@ class UniversalInvestigationEngine:
             if (not selected_set or run["source_name"] in selected_set)
             and (run["status"] not in TERMINAL_SOURCE_STATUSES or bool(selected_set))
         ]
-        budget = max(1, min(int(time_budget_seconds), 55))
-        per_source_budget = max(1, budget // max(1, len(open_runs)))
         details: list[dict[str, Any]] = []
 
-        for run in open_runs:
+        for run_index, run in enumerate(open_runs):
             source_name = run["source_name"]
             previous_diagnostics = list(run.get("diagnostics", []))
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                details.extend(
+                    self._mark_budget_exhausted(
+                        investigation_id,
+                        open_runs[run_index:],
+                        first_source_started=False,
+                    )
+                )
+                break
             try:
-                async with asyncio.timeout(per_source_budget):
+                async with asyncio.timeout(remaining):
                     run = await self._ensure_child(investigation, run)
                     if run["status"] == "complete":
                         details.append(self._source_summary(run))
@@ -201,7 +245,7 @@ class UniversalInvestigationEngine:
                     result = await self.adapters[source_name].process_next_batch(
                         str(run["source_investigation_id"]),
                         batch_size=max(1, batch_size),
-                        time_budget_seconds=per_source_budget,
+                        time_budget_seconds=remaining,
                     )
                 updated = self.store.update_run(
                     investigation_id,
@@ -212,17 +256,15 @@ class UniversalInvestigationEngine:
                 detail = self._source_summary(updated)
                 detail["detalle_fuente"] = result.get("detail", result)
                 details.append(detail)
-            except TimeoutError as exc:
-                updated = self.store.update_run(
-                    investigation_id,
-                    source_name,
-                    status="pending",
-                    diagnostics=[
-                        *previous_diagnostics,
-                        _diagnostic(exc, operation="presupuesto_agotado"),
-                    ],
+            except TimeoutError:
+                details.extend(
+                    self._mark_budget_exhausted(
+                        investigation_id,
+                        open_runs[run_index:],
+                        first_source_started=True,
+                    )
                 )
-                details.append(self._source_summary(updated))
+                break
             except Exception as exc:
                 updated = self.store.update_run(
                     investigation_id,
@@ -260,6 +302,74 @@ class UniversalInvestigationEngine:
             ),
         }
 
+    def _collect_source_report(
+        self,
+        source_name: str,
+        source_id: str,
+        *,
+        required_per_kind: int,
+        include_pending: bool,
+    ) -> dict[str, Any]:
+        """Read each source from zero; source order is preserved for global paging."""
+        evidence: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
+        relations: list[dict[str, Any]] = []
+        cursor = 0
+        report: dict[str, Any] = {}
+        evidence_total = 0
+        pending_total = 0
+
+        while True:
+            page = self.adapters[source_name].get_report(
+                source_id,
+                offset=cursor,
+                maximum_results=min(40, max(1, required_per_kind)),
+                include_pending=include_pending,
+            )
+            if not report:
+                report = dict(page)
+                relations = list(
+                    page.get("familia_documentada_o_candidata", [])
+                )
+            evidence.extend(page.get("evidencias_documentales", []))
+            if include_pending:
+                pending.extend(page.get("paginas_no_leidas", []))
+
+            total = max(
+                len(evidence) + len(pending),
+                int(page.get("total_resultados") or 0),
+            )
+            evidence_total = max(
+                len(evidence), int(page.get("paginas_leidas") or 0)
+            )
+            pending_total = (
+                max(len(pending), total - evidence_total) if include_pending else 0
+            )
+            evidence_target = min(required_per_kind, evidence_total)
+            pending_target = min(required_per_kind, pending_total)
+            if len(evidence) >= evidence_target and len(pending) >= pending_target:
+                break
+
+            pagination = page.get("paginacion") or {}
+            returned = int(
+                pagination.get("devueltos")
+                or len(page.get("evidencias_documentales", []))
+                + len(page.get("paginas_no_leidas", []))
+            )
+            next_cursor = pagination.get("siguiente_desde")
+            if next_cursor is None and returned:
+                next_cursor = cursor + returned
+            if next_cursor is None or int(next_cursor) <= cursor or int(next_cursor) >= total:
+                break
+            cursor = int(next_cursor)
+
+        report["evidencias_documentales"] = evidence
+        report["paginas_no_leidas"] = pending
+        report["familia_documentada_o_candidata"] = relations
+        report["total_evidencias"] = evidence_total
+        report["total_pendientes"] = pending_total
+        return report
+
     def report(
         self,
         investigation_id: str,
@@ -270,10 +380,20 @@ class UniversalInvestigationEngine:
     ) -> dict[str, Any]:
         investigation = self.store.require(investigation_id)
         runs = self.store.source_runs(investigation_id)
+        source_order = {
+            name: index
+            for index, name in enumerate(investigation["requested_sources"])
+        }
+        runs.sort(key=lambda run: source_order.get(run["source_name"], len(runs)))
         evidence: list[dict[str, Any]] = []
         pending: list[dict[str, Any]] = []
         relations: list[dict[str, Any]] = []
         source_coverage: list[dict[str, Any]] = []
+        offset = max(0, offset)
+        maximum_results = max(1, maximum_results)
+        required_per_kind = offset + maximum_results
+        total_evidence = 0
+        total_pending = 0
 
         for run in runs:
             source_name = run["source_name"]
@@ -281,12 +401,14 @@ class UniversalInvestigationEngine:
             coverage = self._source_summary(run)
             if source_id:
                 try:
-                    source_report = self.adapters[source_name].get_report(
+                    source_report = self._collect_source_report(
+                        source_name,
                         str(source_id),
-                        offset=max(0, offset),
-                        maximum_results=max(1, maximum_results),
+                        required_per_kind=required_per_kind,
                         include_pending=include_pending,
                     )
+                    total_evidence += int(source_report.get("total_evidencias") or 0)
+                    total_pending += int(source_report.get("total_pendientes") or 0)
                     coverage.update(
                         {
                             "cobertura": source_report.get("cobertura"),
@@ -350,9 +472,10 @@ class UniversalInvestigationEngine:
             source_coverage.append(coverage)
 
         runs = self.store.source_runs(investigation_id)
-        maximum_results = max(1, maximum_results)
-        evidence = evidence[:maximum_results]
-        pending = pending[:maximum_results] if include_pending else []
+        evidence = evidence[offset : offset + maximum_results]
+        pending = (
+            pending[offset : offset + maximum_results] if include_pending else []
+        )
         return {
             "investigation_id": investigation_id,
             "persona_objetivo": investigation["target"].name,
@@ -368,12 +491,20 @@ class UniversalInvestigationEngine:
                 run["source_name"]: run.get("diagnostics", []) for run in runs
             },
             "paginacion": {
-                "desde": max(0, offset),
+                "desde": offset,
                 "devueltos": len(evidence),
                 "max_resultados": maximum_results,
                 "siguiente_desde": (
-                    max(0, offset) + len(evidence)
-                    if len(evidence) == maximum_results
+                    offset + len(evidence)
+                    if offset + len(evidence) < total_evidence
+                    else None
+                ),
+                "total_evidencias": total_evidence,
+                "devueltos_pendientes": len(pending),
+                "total_pendientes": total_pending,
+                "siguiente_desde_pendientes": (
+                    offset + len(pending)
+                    if include_pending and offset + len(pending) < total_pending
                     else None
                 ),
             },
@@ -381,6 +512,10 @@ class UniversalInvestigationEngine:
                 "datos_objetivo": "aportados por el usuario; no son hallazgos",
                 "texto_documental": "se conserva literalmente, sin corregir el OCR",
                 "trazabilidad": "cada evidencia conserva su fuente e ID interno",
+                "orden_global": (
+                    "orden de fuentes solicitado y, dentro de cada fuente, "
+                    "orden estable de su informe"
+                ),
             },
         }
 

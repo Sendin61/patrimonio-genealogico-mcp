@@ -248,3 +248,44 @@ class UniversalInvestigationStore:
             )
             if cursor.rowcount == 0:
                 raise KeyError("La investigación universal no existe.")
+
+    def update_runs(
+        self,
+        investigation_id: str,
+        updates: list[tuple[str, str, list[dict[str, Any]]]],
+    ) -> dict[str, dict[str, Any]]:
+        """Update several source runs atomically using one database transaction."""
+        if not updates:
+            return {}
+        now = _utc_now()
+        names = [source_name for source_name, _, _ in updates]
+        with self._lock, self._connect() as connection:
+            for source_name, status, diagnostics in updates:
+                self._execute(
+                    connection,
+                    """
+                    UPDATE universal_source_runs
+                    SET status=?, diagnostics_json=?, updated_at=?
+                    WHERE investigation_id=? AND source_name=?
+                    """,
+                    (
+                        status,
+                        _json(diagnostics),
+                        now,
+                        investigation_id,
+                        source_name,
+                    ),
+                )
+            rows = self._execute(
+                connection,
+                "SELECT * FROM universal_source_runs WHERE investigation_id=?",
+                (investigation_id,),
+            ).fetchall()
+        decoded = {
+            row["source_name"]: self._decode_run(row)
+            for row in rows
+            if row["source_name"] in names
+        }
+        if len(decoded) != len(set(names)):
+            raise KeyError("Alguna ejecución de fuente no existe.")
+        return decoded

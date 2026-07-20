@@ -60,7 +60,12 @@ def _normalise(value: str) -> str:
     return "".join(char for char in decomposed if not unicodedata.combining(char))
 
 
-def _contexts(text: str, terms: list[str], maximum: int = 8) -> list[str]:
+def _contexts(
+    text: str,
+    terms: list[str],
+    maximum_characters: int,
+    maximum: int = 8,
+) -> list[str]:
     normalised = _normalise(text)
     spans: list[tuple[int, int]] = []
     for term in terms:
@@ -81,11 +86,56 @@ def _contexts(text: str, terms: list[str], maximum: int = 8) -> list[str]:
             merged[-1] = (merged[-1][0], max(merged[-1][1], end))
         else:
             merged.append((start, end))
-    return [
-        re.sub(r"\s+", " ", text[start:end]).strip()
-        for start, end in merged[:maximum]
-        if text[start:end].strip()
-    ]
+    contexts: list[str] = []
+    remaining = max(0, maximum_characters)
+    for start, end in merged[:maximum]:
+        if remaining <= 0:
+            break
+        fragment = re.sub(r"\s+", " ", text[start:end]).strip()
+        if fragment:
+            contexts.append(fragment[:remaining])
+            remaining -= len(contexts[-1])
+    return contexts
+
+
+def _compact_metadata(value: Any, *, depth: int = 0) -> Any:
+    """Bound diagnostic metadata without returning another copy of source text."""
+    if depth >= 3:
+        return str(value)[:300]
+    if isinstance(value, str):
+        return value[:600]
+    if isinstance(value, dict):
+        return {
+            str(key): _compact_metadata(item, depth=depth + 1)
+            for key, item in list(value.items())[:20]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_compact_metadata(item, depth=depth + 1) for item in value[-10:]]
+    return value
+
+
+def _source_detail(detail: dict[str, Any], original_length: int) -> dict[str, Any]:
+    useful_fields = (
+        "estado",
+        "lectura_completa",
+        "url",
+        "ocr_url",
+        "imagen_pagina",
+        "mets_url",
+        "url_mets",
+        "mets",
+        "errores_recuperacion",
+        "error",
+        "diagnostico",
+        "diagnosticos",
+    )
+    compact = {
+        field: _compact_metadata(detail[field])
+        for field in useful_fields
+        if field in detail
+    }
+    compact["longitud_texto_original"] = original_length
+    return compact
 
 
 class GalicianaSourceAdapter:
@@ -184,17 +234,21 @@ class GalicianaSourceAdapter:
     ) -> dict[str, Any]:
         detail = await self.connector.read_page(source_url)
         full_text = str(detail.get("texto_ocr") or "")
-        contexts = _contexts(full_text, terms) if terms else []
+        maximum_characters = max(1, maximum_characters)
+        contexts = (
+            _contexts(full_text, terms, maximum_characters) if terms else []
+        )
+        content = "" if contexts else full_text[:maximum_characters]
         return {
             "fuente": self.source_name,
             "estado": detail.get("estado"),
             "source_url": detail.get("url") or source_url,
-            "content": "" if contexts else full_text[:maximum_characters],
+            "content": content,
             "contextos": contexts,
             "documento": {
                 "url_ocr": detail.get("ocr_url"),
                 "url_imagen": detail.get("imagen_pagina"),
                 "longitud_contenido": len(full_text),
             },
-            "detalle_fuente": detail,
+            "detalle_fuente": _source_detail(detail, len(full_text)),
         }

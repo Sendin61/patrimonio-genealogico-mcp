@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import sqlite3
 from types import SimpleNamespace
 from typing import Any
@@ -189,6 +191,186 @@ async def test_partial_when_one_source_completes_and_another_fails(tmp_path) -> 
     assert runs["documentada"]["status"] == "complete"
     assert runs["fallida"]["status"] == "failed"
     assert "falló al procesar" in runs["fallida"]["diagnostics"][0]["mensaje"]
+
+
+@pytest.mark.asyncio
+async def test_process_uses_one_global_deadline_and_leaves_unstarted_sources_pending(
+    tmp_path,
+) -> None:
+    class SlowSource(FakeSourceAdapter):
+        async def process_next_batch(self, source_investigation_id, **kwargs):
+            del source_investigation_id, kwargs
+            self.processed += 1
+            await asyncio.sleep(0.2)
+            return {"status": "complete", "complete": True}
+
+    adapters = [SlowSource(f"source-{index}") for index in range(3)]
+    engine, store = make_engine(tmp_path, *adapters)
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"),
+        requested_sources=[adapter.source_name for adapter in adapters],
+    )
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    result = await engine.process(
+        created["investigation_id"], time_budget_seconds=0.03
+    )
+    elapsed = loop.time() - started
+
+    assert elapsed < 0.12
+    assert result["estado"] == "processing"
+    assert adapters[0].processed == 1
+    assert [adapter.processed for adapter in adapters[1:]] == [0, 0]
+    runs = store.source_runs(created["investigation_id"])
+    assert [run["status"] for run in runs] == ["pending", "pending", "pending"]
+    assert runs[1]["diagnostics"][-1]["operacion"] == (
+        "presupuesto_agotado_antes_de_iniciar"
+    )
+    assert "antes de iniciar" in runs[1]["diagnostics"][-1]["mensaje"]
+
+
+@pytest.mark.asyncio
+async def test_report_applies_one_deterministic_global_pagination(tmp_path) -> None:
+    class PaginatedSource(FakeSourceAdapter):
+        def __init__(self, source_name, evidence_count, pending_count):
+            super().__init__(source_name, complete_on_create=True)
+            self.evidence = [
+                {
+                    "fecha": f"1900-01-{index + 1:02d}",
+                    "titulo": f"{source_name}-evidence-{index}",
+                    "url_pagina": f"https://example.invalid/{source_name}/e/{index}",
+                    "contexto": f"context-{source_name}-{index}",
+                }
+                for index in range(evidence_count)
+            ]
+            self.pending = [
+                {
+                    "titulo": f"{source_name}-pending-{index}",
+                    "url_pagina": f"https://example.invalid/{source_name}/p/{index}",
+                }
+                for index in range(pending_count)
+            ]
+            self.report_offsets = []
+
+        def get_report(self, source_investigation_id, **kwargs):
+            offset = kwargs["offset"]
+            limit = kwargs["maximum_results"]
+            self.report_offsets.append(offset)
+            rows = [
+                ("evidence", item) for item in self.evidence
+            ] + [("pending", item) for item in self.pending]
+            page = rows[offset : offset + limit]
+            return {
+                "cobertura": 1.0,
+                "total_resultados": len(rows),
+                "paginas_leidas": len(self.evidence),
+                "paginas_pendientes": len(self.pending),
+                "paginas_fallidas": 0,
+                "evidencias_documentales": [
+                    item for kind, item in page if kind == "evidence"
+                ],
+                "paginas_no_leidas": [
+                    item for kind, item in page if kind == "pending"
+                ],
+                "familia_documentada_o_candidata": [],
+                "paginacion": {
+                    "devueltos": len(page),
+                    "siguiente_desde": (
+                        offset + len(page)
+                        if offset + len(page) < len(rows)
+                        else None
+                    ),
+                },
+                "source_investigation_id": source_investigation_id,
+            }
+
+    first = PaginatedSource("first", 4, 2)
+    second = PaginatedSource("second", 3, 3)
+    engine, _ = make_engine(tmp_path, first, second)
+
+    created = await engine.create_investigation(
+        InvestigationTarget(name="Persona"),
+        requested_sources=["first", "second"],
+    )
+    investigation_id = created["investigation_id"]
+    page_one = engine.report(investigation_id, offset=0, maximum_results=3)
+    page_two = engine.report(investigation_id, offset=3, maximum_results=3)
+    page_three = engine.report(investigation_id, offset=6, maximum_results=3)
+
+    titles_one = [item["titulo"] for item in page_one["evidencias_documentales"]]
+    titles_two = [item["titulo"] for item in page_two["evidencias_documentales"]]
+    titles_three = [item["titulo"] for item in page_three["evidencias_documentales"]]
+    assert titles_one == [f"first-evidence-{index}" for index in range(3)]
+    assert titles_two == [
+        "first-evidence-3",
+        "second-evidence-0",
+        "second-evidence-1",
+    ]
+    assert titles_three == ["second-evidence-2"]
+    assert len(set(titles_one + titles_two + titles_three)) == 7
+    assert page_one["paginacion"]["siguiente_desde"] == 3
+    assert page_two["paginacion"]["siguiente_desde"] == 6
+    assert page_three["paginacion"]["siguiente_desde"] is None
+    assert page_three["paginacion"]["total_evidencias"] == 7
+    assert first.report_offsets[0] == second.report_offsets[0] == 0
+    assert first.report_offsets.count(0) == second.report_offsets.count(0) == 3
+    assert all(
+        item["fuente"] and item["investigation_id_fuente"]
+        for item in page_two["evidencias_documentales"]
+    )
+    assert [
+        item["titulo"] for item in page_one["elementos_pendientes"]
+    ] == ["first-pending-0", "first-pending-1", "second-pending-0"]
+    assert [
+        item["titulo"] for item in page_two["elementos_pendientes"]
+    ] == ["second-pending-1", "second-pending-2"]
+    assert page_one["paginacion"]["siguiente_desde_pendientes"] == 3
+    assert page_two["paginacion"]["siguiente_desde_pendientes"] is None
+
+
+@pytest.mark.asyncio
+async def test_read_source_bounds_large_ocr_and_removes_text_duplicates() -> None:
+    full_text = "A" * 60_000 + " NOMBRE OBJETIVO " + "B" * 60_000
+
+    class FakeGalicianaEngine:
+        timeout = 12
+        transport = None
+        store = SimpleNamespace(investigation=lambda investigation_id: None)
+
+    class LargeConnector:
+        async def read_page(self, url):
+            return {
+                "estado": "ok",
+                "lectura_completa": True,
+                "url": url,
+                "ocr_url": "https://example.invalid/alto",
+                "imagen_pagina": "https://example.invalid/image",
+                "mets_url": "https://example.invalid/mets",
+                "texto_ocr": full_text,
+                "texto_visible": full_text,
+                "mets": "M" * 20_000,
+                "errores_recuperacion": ["diagnóstico compacto"],
+            }
+
+    adapter = GalicianaSourceAdapter(
+        FakeGalicianaEngine(), connector=LargeConnector()
+    )
+    result = await adapter.read_source(
+        "https://example.invalid/page",
+        terms=["NOMBRE OBJETIVO"],
+        maximum_characters=1_200,
+    )
+
+    returned_text = len(result["content"]) + sum(
+        len(context) for context in result["contextos"]
+    )
+    assert returned_text <= 1_200
+    assert "texto_ocr" not in result["detalle_fuente"]
+    assert "texto_visible" not in result["detalle_fuente"]
+    assert result["detalle_fuente"]["longitud_texto_original"] == len(full_text)
+    assert len(result["detalle_fuente"]["mets"]) <= 600
+    assert len(json.dumps(result, ensure_ascii=False)) < 10_000
 
 
 @pytest.mark.asyncio
