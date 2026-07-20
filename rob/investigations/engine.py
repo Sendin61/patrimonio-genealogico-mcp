@@ -919,6 +919,10 @@ class UniversalInvestigationEngine:
             )
             if mode == "compacto":
                 result_item = {key: item.get(key) for key in compact_fields}
+                if "coincidencia_verificada" in item:
+                    result_item["coincidencia_verificada"] = item[
+                        "coincidencia_verificada"
+                    ]
                 result_item["categorias"] = categories
                 result_item["fragmento_relevante"] = fragment
                 result_item["hechos_extraidos"] = facts

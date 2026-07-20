@@ -99,7 +99,55 @@ async def test_universal_report_falls_back_to_persisted_full_galiciana_ocr(
     )
     evidence = report["evidencias_documentales"][0]
 
+    assert evidence["coincidencia_verificada"] is True
     assert TARGET in evidence["fragmento_relevante"]
     assert "Texto ajeno" not in evidence["fragmento_relevante"]
     assert "contexto" not in evidence
     assert len(evidence["fragmento_relevante"]) <= 180
+
+class FalsePositiveGalicianaStore(FakeGalicianaStore):
+    def report_rows(self, investigation_id, limit, offset):
+        del investigation_id, limit, offset
+        return [
+            {
+                "status": "read",
+                "full_text": (
+                    "Esperando a los monarcas. El presidente de la Audiencia "
+                    "territorial asistió al recibimiento. No consta la persona "
+                    "investigada en el OCR completo."
+                ),
+            }
+        ]
+
+
+class FalsePositiveGalicianaEngine(FakeGalicianaEngine):
+    def __init__(self):
+        self.store = FalsePositiveGalicianaStore()
+
+
+@pytest.mark.asyncio
+async def test_universal_report_marks_unverified_galiciana_false_positive(
+    tmp_path,
+) -> None:
+    adapter = GalicianaSourceAdapter(FalsePositiveGalicianaEngine())
+    engine = UniversalInvestigationEngine(
+        UniversalInvestigationStore(str(tmp_path / "universal.sqlite3")),
+        [adapter],
+    )
+    created = await engine.create_investigation(
+        InvestigationTarget(name=TARGET),
+        requested_sources=["galiciana"],
+    )
+
+    report = engine.report(
+        created["investigation_id"],
+        maximum_results=1,
+        maximum_context_characters=180,
+    )
+    evidence = report["evidencias_documentales"][0]
+
+    assert evidence["coincidencia_verificada"] is False
+    assert evidence["puntuacion"] == 0.0
+    assert evidence["categorias"] == ["resultado de búsqueda no verificado"]
+    assert evidence["fragmento_relevante"] == ""
+    assert "contexto" not in evidence
