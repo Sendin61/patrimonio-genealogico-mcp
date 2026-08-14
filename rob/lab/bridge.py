@@ -9,6 +9,7 @@ from typing import Any
 
 class BridgeCommandType(StrEnum):
     PING = "ping"
+    FAMILYSEARCH_FETCH = "familysearch_fetch"
     FULLTEXT_SEARCH = "fulltext_search"
     RECORD_SEARCH = "record_search"
     TREE_PERSON = "tree_person"
