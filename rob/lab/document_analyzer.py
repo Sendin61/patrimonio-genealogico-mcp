@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .ai.base import AIProvider, chat_json
+from .document_domains import detect_document_profiles
 from .models import DocumentContext
 from .ocr_resolver import multipage_excerpt
 
@@ -96,14 +97,34 @@ SCHEMA: dict[str, Any] = {
 SYSTEM = """Eres el analista documental de ROB Genealogy Lab. Recibes OCR histórico de
 VARIAS páginas que forman probablemente un mismo documento, más el objetivo del expediente.
 
-Reglas:
-- El OCR puede estar gravemente corrupto.
-- Lee el documento como un conjunto, no página por página de forma aislada.
+DOMINIO PRIORITARIO
+Trabajas especialmente con documentación española e ibérica de los siglos modernos y
+contemporáneos: protocolos notariales, testamentos, codicilos, inventarios, particiones/partijas,
+hijuelas, poderes, compraventas, foros, dotes, capitulaciones, obligaciones, cartas de pago,
+pleitos, expedientes, probanzas, registros parroquiales/civiles, padrones y documentación
+administrativa. También debes funcionar con documentación internacional: si el perfil español
+no encaja, no impongas sus fórmulas.
+
+REGLAS DE LECTURA
+- El OCR puede estar gravemente corrupto, sin puntuación fiable, con abreviaturas, grafías
+  antiguas, palabras unidas/partidas y nombres destrozados.
+- Lee el documento como un ACTO y una secuencia documental, no como páginas independientes.
+- Reconstruye mentalmente funciones documentales: apertura/comparecencia, identificación y
+  vecindad, filiación/estado, objeto jurídico, declaraciones, bienes, disposiciones, herederos,
+  legados, deudas, testigos, firmas/cierre, diligencias o documentos insertos.
+- Un nombre puede no repetirse durante varias páginas y seguir siendo el mismo acto.
+- Distingue parentesco genealógico de rol jurídico. "heredero", "albacea", "apoderado",
+  "testigo", "comprador" o "fiador" NO implican por sí mismos parentesco.
 - No conviertas una coincidencia de nombre en identidad segura.
-- Diferencia texto observado de interpretaciones.
+- Diferencia siempre texto observado de interpretaciones.
 - Si una palabra/nombre parece destrozado por OCR, conserva raw_ocr y propone candidate solo
-  cuando el contexto multipágina, parentesco, repeticiones o conocimiento del expediente lo apoyen.
-- Una gran distancia ortográfica no invalida por sí sola una reconstrucción contextual.
+  cuando contexto multipágina, parentesco, repetición, estructura jurídica o conocimiento del
+  expediente lo apoyen. Una gran distancia ortográfica NO invalida una reconstrucción contextual.
+- Para reconstrucciones como raw_ocr='Bea' -> candidate='Varela', explica qué elementos del
+  mismo documento o expediente sostienen el salto; si la lectura gráfica no está comprobada,
+  needs_visual_check=true.
+- Ten en cuenta variantes históricas y regionales de castellano, gallego, catalán, portugués y
+  latín cuando aparezcan; no modernices silenciosamente los nombres propios.
 - Toda relación o hipótesis debe citar las páginas (números [[IMG ...]]) que la sostienen.
 - evidence debe ser breve y fiel al OCR; no inventes una cita limpia que no esté en el texto.
 - Si el documento parece empezar antes o continuar después, solicita más contexto.
@@ -134,9 +155,12 @@ class DocumentAnalyzer:
             focus_terms=target_terms,
             maximum_characters=60000,
         )
+        profiles = detect_document_profiles(excerpt, limit=3)
         user = (
             "OBJETIVO ESTRUCTURADO DEL EXPEDIENTE:\n"
             f"{interpretation}\n\n"
+            "PERFILES_DOCUMENTALES DETECTADOS (heurística; pueden equivocarse):\n"
+            f"{profiles}\n\n"
             "MOTIVOS DEL RANKING PREVIO (heurística, no evidencia):\n"
             f"{rank_reasons or []}\n\n"
             f"DOCUMENTO ESTIMADO: imágenes {context.estimated_start_image}-{context.estimated_end_image}\n"
