@@ -4,7 +4,7 @@ import asyncio
 import time
 from typing import Any
 
-from .ai import AIProvider, interpret_research_request
+from .ai import AIProvider, fallback_interpretation, interpret_research_request
 from .bridge import BridgeCommand, BridgeCommandType, BridgeResult, InMemoryBridgeQueue
 from .document_analyzer import DocumentAnalyzer
 from .familysearch_context import FamilySearchDocumentReader
@@ -56,6 +56,7 @@ class ResearchOrchestrator:
         store: LabStore,
         pause_between_queries: float = 1.25,
         initial_deep_candidates: int = 4,
+        fast_interpretation_timeout: float = 18.0,
     ) -> None:
         self.provider = provider
         self.bridge = bridge
@@ -63,17 +64,47 @@ class ResearchOrchestrator:
         self.store = store
         self.pause_between_queries = max(0.75, pause_between_queries)
         self.initial_deep_candidates = max(1, min(initial_deep_candidates, 20))
+        self.fast_interpretation_timeout = max(6.0, min(fast_interpretation_timeout, 60.0))
 
     async def start(self, raw_request: str) -> str:
         investigation_id = self.store.create_investigation(raw_request)
         asyncio.create_task(self.run(investigation_id, raw_request))
         return investigation_id
 
+    async def _interpret_without_blocking(self, investigation_id: str, raw_request: str) -> dict[str, Any]:
+        try:
+            interpretation = await asyncio.wait_for(
+                interpret_research_request(self.provider, raw_request),
+                timeout=self.fast_interpretation_timeout,
+            )
+            self.store.add_event(
+                investigation_id,
+                "interpreted_ai",
+                {"mode": "local_ai_fast", "timeout_seconds": self.fast_interpretation_timeout},
+            )
+            return interpretation
+        except Exception as exc:
+            interpretation = fallback_interpretation(
+                raw_request,
+                reason=f"{type(exc).__name__}: {str(exc).strip()}".strip(),
+            )
+            self.store.add_event(
+                investigation_id,
+                "interpretation_fallback",
+                {
+                    "reason": type(exc).__name__,
+                    "message": str(exc),
+                    "mode": "deterministic_local_fallback",
+                    "continued": True,
+                },
+            )
+            return interpretation
+
     async def run(self, investigation_id: str, raw_request: str) -> None:
         try:
             self.store.update_investigation(investigation_id, status="interpreting")
             self.store.add_event(investigation_id, "interpreting", {})
-            interpretation = await interpret_research_request(self.provider, raw_request)
+            interpretation = await self._interpret_without_blocking(investigation_id, raw_request)
 
             plan = build_research_plan(interpretation)
             self.store.update_investigation(
