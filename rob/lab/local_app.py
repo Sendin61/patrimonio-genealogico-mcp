@@ -78,12 +78,21 @@ setInterval(status,2500); status();
 function eventLine(event){
  const when=new Date((event.created_at||0)*1000).toLocaleTimeString();
  const p=event.payload||{};
+ if(event.kind==='interpreting') return `${when}  Interpretando tu petición…`;
  if(event.kind==='query_started') return `${when}  Buscando ${p.position}/${p.total}: ${p.query}`;
  if(event.kind==='query_completed') return `${when}  ✓ ${p.returned} resultados (${p.with_ocr} con OCR) · ${p.query}`;
  if(event.kind==='query_failed') return `${when}  ✗ ${p.query}: ${p.error}`;
  if(event.kind==='planned') return `${when}  Plan preparado: ${p.actions} búsquedas iniciales.`;
  if(event.kind==='waiting_familysearch') return `${when}  Esperando una pestaña FamilySearch conectada…`;
- if(event.kind==='search_phase_complete') return `${when}  Primera búsqueda terminada. ${p.unique_items} resultados únicos guardados.`;
+ if(event.kind==='candidates_ranked') return `${when}  Ranking local: ${p.count} candidatos; seleccionando los mejores para lectura profunda.`;
+ if(event.kind==='context_started') return `${when}  Leyendo documento ${p.position}/${p.total} alrededor de ${p.source_key}…`;
+ if(event.kind==='context_built') return `${when}  ✓ Documento reconstruido: ${p.pages} páginas (${p.from}-${p.to}).`;
+ if(event.kind==='context_unavailable') return `${when}  · Sin contexto estructurado para ${p.source_key}: ${p.error}`;
+ if(event.kind==='analysis_failed') return `${when}  ✗ Falló análisis local de ${p.source_key}: ${p.error}`;
+ if(event.kind==='document_analyzed') return `${when}  ✓ Documento analizado · relevancia ${p.relevance ?? '—'} · ${p.relationships} relaciones · ${p.ocr_suspicions} dudas OCR · ${p.hypotheses} hipótesis. ${p.summary||''}`;
+ if(event.kind==='analysis_phase_complete') return `${when}  Fase inicial terminada: ${p.documents_analyzed}/${p.deep_candidates} documentos analizados con contexto multipágina.`;
+ if(event.kind==='complete_no_candidates') return `${when}  No aparecieron candidatos analizables en esta primera estrategia.`;
+ if(event.kind==='paused_familysearch') return `${when}  Pausado: ${p.message||'FamilySearch no está conectado.'}`;
  if(event.kind==='error') return `${when}  ERROR ${p.type||''}: ${p.message||''}`;
  return `${when}  ${event.kind}`;
 }
@@ -98,7 +107,7 @@ async function pollInvestigation(){
   const shown={status:inv.status, interpretation:inv.interpretation, plan:inv.plan, stored_items:j.stored_items};
   document.getElementById('request').textContent=JSON.stringify(shown,null,2);
   document.getElementById('activity').textContent=(j.events||[]).map(eventLine).join('\n')||'Preparando…';
-  const terminal=['search_phase_complete','error','paused_familysearch'];
+  const terminal=['analysis_phase_complete','complete_no_candidates','error','paused_familysearch'];
   if(terminal.includes(inv.status)) document.getElementById('go').disabled=false;
  }catch(e){}
 }
