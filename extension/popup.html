@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ROB FamilySearch Bridge</title>
+<style>
+body{font:13px/1.4 Segoe UI,system-ui,sans-serif;width:330px;margin:0;padding:14px;background:#151719;color:#f4f4f4}
+h2{font-size:16px;margin:0 0 10px}.box{background:#202428;border-radius:10px;padding:11px;margin:9px 0}.ok{color:#9be19b}.bad{color:#ffadad}button{width:100%;padding:9px;border:0;border-radius:8px;cursor:pointer;font-weight:650;margin-top:8px}small{color:#adb5bd}code{font-size:11px}
+</style>
+</head>
+<body>
+<h2>ROB · FamilySearch</h2>
+<div class="box"><div id="backend">ROB local: comprobando…</div><div id="fs">FamilySearch: comprobando…</div><div id="worker">Puente: comprobando…</div></div>
+<button id="start">Conectar / reactivar puente</button>
+<div class="box"><small>Abre FamilySearch normalmente e inicia sesión tú mismo. ROB usa esa pestaña; no exporta cookies ni credenciales.</small></div>
+<div id="error" class="bad"></div>
+<script src="popup.js"></script>
+</body>
+</html>
