@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "ROB Genealogy Lab — FamilySearch Bridge",
+  "version": "0.1.0",
+  "description": "Puente local privado entre ROB Genealogy Lab y una pestaña normal de FamilySearch.",
+  "permissions": ["tabs", "scripting", "storage"],
+  "host_permissions": [
+    "https://familysearch.org/*",
+    "https://*.familysearch.org/*",
+    "http://127.0.0.1:8877/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "ROB FamilySearch Bridge"
+  }
+}
