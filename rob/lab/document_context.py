@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from .models import DocumentContext, PageContext
@@ -15,6 +16,8 @@ class DocumentContextBuilder:
     The builder deliberately separates retrieval from interpretation. The caller provides
     a page loader and a continuity decider. The default initial window is +/-3 images,
     then the context may expand until a boundary is detected or the safety limit is hit.
+    Initial page retrieval is concurrent so a seven-page context does not feel like seven
+    serial viewer navigations.
     """
 
     def __init__(
@@ -35,12 +38,13 @@ class DocumentContextBuilder:
         self.max_extra_pages_each_side = max_extra_pages_each_side
 
     async def _load_range(self, start: int, end: int) -> dict[int, PageContext]:
-        pages: dict[int, PageContext] = {}
-        for number in range(max(1, start), max(1, end) + 1):
-            page = await self.page_loader(number)
-            if page is not None:
-                pages[number] = page
-        return pages
+        numbers = list(range(max(1, start), max(1, end) + 1))
+        loaded = await asyncio.gather(*(self.page_loader(number) for number in numbers))
+        return {
+            number: page
+            for number, page in zip(numbers, loaded, strict=True)
+            if page is not None
+        }
 
     async def build(self, center_image: int) -> DocumentContext:
         if center_image < 1:
