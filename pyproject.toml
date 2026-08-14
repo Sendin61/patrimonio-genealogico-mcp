@@ -18,6 +18,10 @@ remote-ai = [
     "openai>=1,<3",
 ]
 
+[tool.setuptools.packages.find]
+include = ["rob*"]
+exclude = ["tests*", "extension*"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
