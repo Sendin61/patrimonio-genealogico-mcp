@@ -2,6 +2,10 @@
 setlocal
 cd /d "%~dp0"
 
+rem The application root is ALWAYS the folder containing this launcher.
+rem This avoids losing the local model when Windows extracts the ZIP inside an outer folder.
+set "ROB_LAB_HOME=%~dp0"
+
 if not exist ".venv\Scripts\python.exe" (
   echo [ROB] Preparando entorno local por primera vez...
   py -3 -m venv .venv
@@ -11,8 +15,6 @@ if not exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m pip install -e .
   if errorlevel 1 goto :error
 )
-
-if not exist "%USERPROFILE%\Downloads\ROB-Genealogy-Lab" mkdir "%USERPROFILE%\Downloads\ROB-Genealogy-Lab"
 
 set "ROB_CHROME="
 if exist "%ProgramFiles%\Google\Chrome\Application\chrome.exe" set "ROB_CHROME=%ProgramFiles%\Google\Chrome\Application\chrome.exe"
