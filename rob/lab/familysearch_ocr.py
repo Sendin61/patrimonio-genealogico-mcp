@@ -17,14 +17,16 @@ class StructuredOCRPage:
     dgs_image_number: int | None
     raw_text: str
     raw_json: dict[str, Any]
+    tokens: list[dict[str, Any]]
 
     def to_page_context(self) -> PageContext:
         number = self.dgs_image_number or 0
         return PageContext(
             image_number=number,
             ark=self.image_ark,
+            dgs=self.dgs,
             raw_text=self.raw_text,
-            structured_ocr=self.raw_json,
+            structured_tokens=self.tokens,
             metadata={
                 "apid": self.apid,
                 "fs_image_id": self.fs_image_id,
@@ -49,6 +51,35 @@ def _property_map(payload: dict[str, Any]) -> dict[str, str]:
     return output
 
 
+def _document_regions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    stuff = payload.get("stuff") if isinstance(payload.get("stuff"), dict) else {}
+    regions = stuff.get("regions") if isinstance(stuff.get("regions"), list) else []
+    return [
+        region
+        for region in regions
+        if isinstance(region, dict) and str(region.get("type") or "").upper() != "CRUFT"
+    ]
+
+
+def _structured_tokens(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    for region_index, region in enumerate(_document_regions(payload)):
+        lines = region.get("lines") if isinstance(region.get("lines"), list) else []
+        for line_index, line in enumerate(lines):
+            if not isinstance(line, dict):
+                continue
+            tokens = line.get("tokens") if isinstance(line.get("tokens"), list) else []
+            for token_index, token in enumerate(tokens):
+                if not isinstance(token, dict):
+                    continue
+                value = dict(token)
+                value.setdefault("region_index", region_index)
+                value.setdefault("line_index", line_index)
+                value.setdefault("token_index", token_index)
+                output.append(value)
+    return output
+
+
 def _line_text(tokens: list[Any]) -> str:
     words: list[str] = []
     for token in tokens:
@@ -61,15 +92,8 @@ def _line_text(tokens: list[Any]) -> str:
 
 
 def structured_ocr_text(payload: dict[str, Any]) -> str:
-    stuff = payload.get("stuff") if isinstance(payload.get("stuff"), dict) else {}
-    regions = stuff.get("regions") if isinstance(stuff.get("regions"), list) else []
     paragraphs: list[str] = []
-    for region in regions:
-        if not isinstance(region, dict):
-            continue
-        # CRUFT tends to contain viewer marks rather than documentary text.
-        if str(region.get("type") or "").upper() == "CRUFT":
-            continue
+    for region in _document_regions(payload):
         lines = region.get("lines") if isinstance(region.get("lines"), list) else []
         line_values = []
         for line in lines:
@@ -104,4 +128,5 @@ def parse_structured_ocr(image_ark: str, payload: dict[str, Any]) -> StructuredO
         dgs_image_number=image_number,
         raw_text=structured_ocr_text(payload),
         raw_json=payload,
+        tokens=_structured_tokens(payload),
     )
