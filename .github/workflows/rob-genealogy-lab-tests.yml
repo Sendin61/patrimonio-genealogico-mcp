@@ -21,3 +21,20 @@ jobs:
           python -m pip install -e ".[dev]"
       - name: Test
         run: pytest -q
+      - name: Build tested alpha ZIP
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/rob-genealogy-lab'
+        run: |
+          rm -rf /tmp/rob-alpha
+          mkdir -p /tmp/rob-alpha/ROB-Genealogy-Lab
+          git archive --format=tar HEAD | tar -x -C /tmp/rob-alpha/ROB-Genealogy-Lab
+          rm -rf /tmp/rob-alpha/ROB-Genealogy-Lab/.github
+          cd /tmp/rob-alpha
+          zip -qr "$GITHUB_WORKSPACE/ROB-Genealogy-Lab-Alpha.zip" ROB-Genealogy-Lab
+      - name: Upload tested alpha ZIP
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feature/rob-genealogy-lab'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ROB-Genealogy-Lab-Alpha
+          path: ROB-Genealogy-Lab-Alpha.zip
+          if-no-files-found: error
+          retention-days: 14
