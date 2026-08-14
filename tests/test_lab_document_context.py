@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from rob.lab.document_context import DocumentContextBuilder
 from rob.lab.models import OCRResolution, OCRStatus, PageContext
 
 
-@pytest.mark.asyncio
-async def test_document_context_expands_until_detected_boundaries() -> None:
+def test_document_context_expands_until_detected_boundaries() -> None:
     pages = {
         number: PageContext(image_number=number, raw_text=f"page {number}")
         for number in range(6, 15)
@@ -26,7 +27,7 @@ async def test_document_context_expands_until_detected_boundaries() -> None:
         initial_radius=1,
         max_extra_pages_each_side=10,
     )
-    context = await builder.build(10)
+    context = asyncio.run(builder.build(10))
 
     assert context.center_image == 10
     assert context.estimated_start_image == 8
