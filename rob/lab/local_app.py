@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
+import asyncio
 from typing import Any
 
 from starlette.applications import Starlette
@@ -9,12 +8,15 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse
 from starlette.routing import Route
 
+from .ai import LlamaCppRuntime, interpret_research_request
 from .bridge import BridgeCommand, BridgeCommandType, BridgeResult, InMemoryBridgeQueue
 from .config import lab_port, resolve_lab_paths
 
 
 bridge = InMemoryBridgeQueue()
 paths = resolve_lab_paths(create=True)
+ai_runtime = LlamaCppRuntime()
+_ai_start_task: asyncio.Task[bool] | None = None
 
 
 APP_HTML = r"""<!doctype html>
@@ -27,44 +29,60 @@ APP_HTML = r"""<!doctype html>
 :root{font-family:Inter,Segoe UI,system-ui,sans-serif;color-scheme:dark}
 body{margin:0;background:#111315;color:#f3f3f3}
 main{max-width:1080px;margin:0 auto;padding:28px}
-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
+header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;gap:12px}
+.badges{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .badge{padding:7px 10px;border-radius:999px;background:#252a2e;font-size:13px}
 .card{background:#191d20;border:1px solid #2d3338;border-radius:14px;padding:18px;margin-bottom:14px}
-textarea{width:100%;box-sizing:border-box;min-height:130px;resize:vertical;border:1px solid #343a40;border-radius:12px;background:#0f1113;color:#fff;padding:14px;font:16px/1.45 inherit}
+textarea{width:100%;box-sizing:border-box;min-height:150px;resize:vertical;border:1px solid #343a40;border-radius:12px;background:#0f1113;color:#fff;padding:14px;font:16px/1.45 inherit}
 button{margin-top:12px;border:0;border-radius:10px;padding:11px 16px;font-weight:650;cursor:pointer}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-pre{white-space:pre-wrap;word-break:break-word;background:#0f1113;padding:14px;border-radius:10px;min-height:80px}
+pre{white-space:pre-wrap;word-break:break-word;background:#0f1113;padding:14px;border-radius:10px;min-height:100px;max-height:520px;overflow:auto}
 small{color:#a8b0b7}
-@media(max-width:760px){.grid{grid-template-columns:1fr}}
+@media(max-width:760px){.grid{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}.badges{justify-content:flex-start}}
 </style>
 </head>
 <body><main>
-<header><div><h1 style="margin:0">ROB Genealogy Lab</h1><small>Investigador genealógico local</small></div><div id="bridge" class="badge">FamilySearch: comprobando…</div></header>
+<header>
+<div><h1 style="margin:0">ROB Genealogy Lab</h1><small>Investigador genealógico local-first</small></div>
+<div class="badges"><div id="ai" class="badge">IA local: comprobando…</div><div id="bridge" class="badge">FamilySearch: comprobando…</div></div>
+</header>
 <section class="card">
 <label for="prompt"><strong>¿Qué quieres investigar?</strong></label>
-<textarea id="prompt" placeholder="Ej.: busca los padres de Andrés Quintás Varela por Arzúa; el OCR puede estar fatal y mira varias páginas del documento antes de concluir."></textarea>
-<button id="go">Preparar investigación</button>
+<textarea id="prompt" placeholder="Ej.: buscame los padres d andres quintas barela x arzua, creo q vivio sobre 1800. ojo q el OCR puede estar destrozado y mira varias paginas antes d concluir."></textarea>
+<button id="go">Interpretar y preparar investigación</button>
 </section>
 <div class="grid">
-<section class="card"><strong>Petición recibida</strong><pre id="request">Todavía no hay una investigación activa.</pre></section>
+<section class="card"><strong>Interpretación</strong><pre id="request">Todavía no hay una investigación activa.</pre></section>
 <section class="card"><strong>Actividad</strong><pre id="activity">Esperando.</pre></section>
 </div>
 <script>
 async function status(){
- const r=await fetch('/api/status'); const j=await r.json();
- document.getElementById('bridge').textContent='FamilySearch: '+(j.familysearch_bridge.connected?'conectado':'sin puente');
+ try{
+  const r=await fetch('/api/status'); const j=await r.json();
+  document.getElementById('bridge').textContent='FamilySearch: '+(j.familysearch_bridge.connected?'conectado':'sin puente');
+  const ai=j.local_ai||{};
+  document.getElementById('ai').textContent='IA local: '+(ai.running?(ai.provider?.model||'lista'):(ai.model_file?'arrancando/no disponible':'sin modelo'));
+ }catch(e){document.getElementById('activity').textContent='No se pudo consultar el backend local.'}
 }
-setInterval(status,3000); status();
+setInterval(status,2500); status();
 document.getElementById('go').onclick=async()=>{
  const text=document.getElementById('prompt').value.trim(); if(!text)return;
- document.getElementById('activity').textContent='Registrando petición…';
+ document.getElementById('activity').textContent='Interpretando tu petición con la IA local…';
  const r=await fetch('/api/research/prepare',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
  const j=await r.json();
- document.getElementById('request').textContent=JSON.stringify(j,null,2);
- document.getElementById('activity').textContent=j.next_step||'Preparada.';
+ document.getElementById('request').textContent=JSON.stringify(j.interpretation||j,null,2);
+ document.getElementById('activity').textContent=j.next_step||j.error||'Preparada.';
+ status();
 };
 </script>
 </main></body></html>"""
+
+
+async def _background_ai_start() -> None:
+    global _ai_start_task
+    if _ai_start_task and not _ai_start_task.done():
+        return
+    _ai_start_task = asyncio.create_task(ai_runtime.ensure_running())
 
 
 async def homepage(request: Request) -> HTMLResponse:
@@ -80,6 +98,7 @@ async def status(request: Request) -> JSONResponse:
                 "connected": bridge.connected,
                 "last_seen_at": bridge.last_extension_seen_at,
             },
+            "local_ai": await ai_runtime.status(),
         }
     )
 
@@ -90,16 +109,47 @@ async def prepare_research(request: Request) -> JSONResponse:
     if not text:
         return JSONResponse({"error": "Petición vacía."}, status_code=400)
 
-    # First executable slice: keep the user's raw request intact. The AI interpreter
-    # will be inserted here; until then we deliberately do not invent structured facts.
-    record = {
-        "raw_request": text,
-        "interpretation_status": "pending_ai",
-        "evidence_policy": "raw_ocr_never_overwritten",
-        "document_context_policy": "adaptive_multipage_required",
-        "next_step": "Conectar intérprete IA y planificador de herramientas.",
-    }
-    return JSONResponse(record)
+    ai_status = await ai_runtime.provider.status()
+    if not ai_status.available:
+        await _background_ai_start()
+        return JSONResponse(
+            {
+                "raw_request": text,
+                "interpretation_status": "waiting_local_ai",
+                "local_ai": await ai_runtime.status(),
+                "evidence_policy": "raw_ocr_never_overwritten",
+                "document_context_policy": "adaptive_multipage_required",
+                "next_step": (
+                    "La petición se ha conservado. Falta preparar/arrancar el modelo GGUF local; "
+                    "no se usará ninguna API de pago como sustituto oculto."
+                ),
+            },
+            status_code=503,
+        )
+
+    try:
+        interpretation = await interpret_research_request(ai_runtime.provider, text)
+    except Exception as exc:
+        return JSONResponse(
+            {
+                "raw_request": text,
+                "interpretation_status": "local_ai_error",
+                "error": str(exc),
+                "next_step": "Revisar llama-server.log; la petición original se conserva intacta.",
+            },
+            status_code=502,
+        )
+
+    return JSONResponse(
+        {
+            "raw_request": text,
+            "interpretation_status": "interpreted_local",
+            "interpretation": interpretation,
+            "evidence_policy": "raw_ocr_never_overwritten",
+            "document_context_policy": "adaptive_multipage_required",
+            "next_step": "Generar plan adaptativo y ejecutarlo mediante el puente FamilySearch.",
+        }
+    )
 
 
 async def bridge_next(request: Request) -> JSONResponse:
@@ -127,8 +177,13 @@ async def bridge_test_command(request: Request) -> JSONResponse:
     return JSONResponse({"command": command.to_dict()})
 
 
+async def startup() -> None:
+    await _background_ai_start()
+
+
 app = Starlette(
     debug=False,
+    on_startup=[startup],
     routes=[
         Route("/", homepage, methods=["GET"]),
         Route("/api/status", status, methods=["GET"]),
