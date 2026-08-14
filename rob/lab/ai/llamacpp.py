@@ -116,15 +116,15 @@ class LlamaCppRuntime:
     """Portable llama.cpp runtime kept under Downloads/ROB-Genealogy-Lab.
 
     The runtime deliberately does not download binaries or models silently. Installation
-    will be handled by an explicit bootstrap action so the user always knows what is
-    being added to the local project directory.
+    is handled by an explicit bootstrap action so the user always knows what is being
+    added to the local project directory.
     """
 
     def __init__(self) -> None:
         paths = resolve_lab_paths(create=True)
         self.root = paths.root
-        self.runtime_dir = self.root / "runtime" / "llama.cpp"
-        self.models_dir = self.root / "models"
+        self.runtime_dir = paths.runtime / "llama.cpp"
+        self.models_dir = paths.models
         self.logs_dir = paths.logs
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +143,7 @@ class LlamaCppRuntime:
                 self.root / "runtime" / "llama-server.exe",
             ]
         )
+        candidates.extend(sorted(self.runtime_dir.rglob("llama-server.exe")))
         on_path = shutil.which("llama-server") or shutil.which("llama-server.exe")
         if on_path:
             candidates.append(Path(on_path))
@@ -218,7 +219,7 @@ class LlamaCppRuntime:
             )
         self._process = subprocess.Popen(
             command,
-            cwd=str(self.runtime_dir),
+            cwd=str(binary.parent),
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
