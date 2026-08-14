@@ -54,33 +54,41 @@ async def _scenario(tmp_path, monkeypatch) -> None:
             if command is None:
                 await asyncio.sleep(0.01)
                 continue
-            query = command.payload.get("query")
+
+            if command.type.value == "fulltext_search":
+                query = command.payload.get("query")
+                payload = {
+                    "json": {
+                        "results": 1,
+                        "entries": [
+                            {
+                                "id": "3:1:TEST-ANA",
+                                "sourceUrl": "https://www.familysearch.org/ark:/61903/3:1:TEST-ANA",
+                                "collectionId": "TEST",
+                                "collectionTitle": "Colección de prueba",
+                                "content": {
+                                    "recordDate": "1800",
+                                    "recordType": "Notarial",
+                                    "recordPlace": "Arzúa",
+                                    "title": "Documento de prueba",
+                                    "textDocument": f"Ana Pérez aparece en este documento. Consulta {query}",
+                                    "entities": [],
+                                    "highlightTexts": ["Ana Pérez"],
+                                },
+                            }
+                        ],
+                    }
+                }
+            else:
+                # Deliberately simulate a candidate whose structured OCR is unavailable.
+                # The orchestrator must keep the search result and complete gracefully.
+                payload = {}
+
             bridge.complete(
                 BridgeResult(
                     command_id=command.id,
                     ok=True,
-                    payload={
-                        "json": {
-                            "results": 1,
-                            "entries": [
-                                {
-                                    "id": "3:1:TEST-ANA",
-                                    "sourceUrl": "https://www.familysearch.org/ark:/61903/3:1:TEST-ANA",
-                                    "collectionId": "TEST",
-                                    "collectionTitle": "Colección de prueba",
-                                    "content": {
-                                        "recordDate": "1800",
-                                        "recordType": "Notarial",
-                                        "recordPlace": "Arzúa",
-                                        "title": "Documento de prueba",
-                                        "textDocument": f"Ana Pérez aparece en este documento. Consulta {query}",
-                                        "entities": [],
-                                        "highlightTexts": ["Ana Pérez"],
-                                    },
-                                }
-                            ],
-                        }
-                    },
+                    payload=payload,
                 )
             )
 
@@ -91,7 +99,6 @@ async def _scenario(tmp_path, monkeypatch) -> None:
         store=store,
         pause_between_queries=0.01,
     )
-    # The production floor is deliberately conservative; bypass only the test wait.
     orchestrator.pause_between_queries = 0.0
     investigation_id = store.create_investigation("busca ana perez")
     await orchestrator.run(investigation_id, "busca ana perez")
@@ -100,13 +107,15 @@ async def _scenario(tmp_path, monkeypatch) -> None:
 
     investigation = store.investigation(investigation_id)
     assert investigation is not None
-    assert investigation["status"] == "search_phase_complete"
+    assert investigation["status"] == "analysis_phase_complete"
     assert store.source_item_count(investigation_id, source="familysearch") == 1
     assert store.search_ocr('"Ana"')
     kinds = [event["kind"] for event in store.events(investigation_id)]
     assert "planned" in kinds
     assert "query_completed" in kinds
-    assert "search_phase_complete" in kinds
+    assert "candidates_ranked" in kinds
+    assert "context_unavailable" in kinds
+    assert "analysis_phase_complete" in kinds
 
 
 def test_end_to_end_orchestrator(monkeypatch, tmp_path) -> None:
