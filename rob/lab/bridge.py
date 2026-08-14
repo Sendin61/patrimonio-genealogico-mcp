@@ -45,27 +45,33 @@ class BridgeResult:
 
 
 class InMemoryBridgeQueue:
-    """Small first-step queue for the local app/extension handshake.
+    """Small local command queue between ROB and the Chrome extension.
 
-    Persistence and retry semantics belong in the later SQLite-backed bridge store.
-    This object intentionally contains no FamilySearch authentication material.
+    No FamilySearch authentication material is stored here.  The extension periodically
+    long-polls the backend, so connection detection deliberately tolerates an interval
+    comfortably longer than the poll duration.
     """
+
+    CONNECTED_TTL_SECONDS = 45.0
 
     def __init__(self) -> None:
         self._pending: list[BridgeCommand] = []
         self._results: dict[str, BridgeResult] = {}
         self.last_extension_seen_at: float | None = None
 
+    def touch(self) -> None:
+        self.last_extension_seen_at = time.time()
+
     def enqueue(self, command: BridgeCommand) -> BridgeCommand:
         self._pending.append(command)
         return command
 
     def next_command(self) -> BridgeCommand | None:
-        self.last_extension_seen_at = time.time()
+        self.touch()
         return self._pending.pop(0) if self._pending else None
 
     def complete(self, result: BridgeResult) -> None:
-        self.last_extension_seen_at = time.time()
+        self.touch()
         self._results[result.command_id] = result
 
     def result(self, command_id: str) -> BridgeResult | None:
@@ -78,5 +84,5 @@ class InMemoryBridgeQueue:
     def connected(self) -> bool:
         return bool(
             self.last_extension_seen_at
-            and time.time() - self.last_extension_seen_at < 15
+            and time.time() - self.last_extension_seen_at < self.CONNECTED_TTL_SECONDS
         )
