@@ -188,6 +188,24 @@ class LabStore:
                 (investigation_id, kind, _dump(payload), time.time()),
             )
 
+    def events(self, investigation_id: str, *, after_id: int = 0, limit: int = 250) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id,kind,payload_json,created_at
+                FROM investigation_events
+                WHERE investigation_id=? AND id>?
+                ORDER BY id ASC LIMIT ?
+                """,
+                (investigation_id, max(0, after_id), max(1, min(limit, 1000))),
+            ).fetchall()
+        output: list[dict[str, Any]] = []
+        for row in rows:
+            value = dict(row)
+            value["payload"] = _load(value.pop("payload_json")) or {}
+            output.append(value)
+        return output
+
     def upsert_source_item(
         self,
         investigation_id: str,
@@ -208,6 +226,15 @@ class LabStore:
                 """,
                 (investigation_id, source, source_key, item_type, _dump(payload), now, now),
             )
+
+    def source_item_count(self, investigation_id: str, *, source: str | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM source_items WHERE investigation_id=?"
+        args: list[Any] = [investigation_id]
+        if source:
+            sql += " AND source=?"
+            args.append(source)
+        with self.connect() as connection:
+            return int(connection.execute(sql, args).fetchone()[0])
 
     def upsert_ocr_page(
         self,
