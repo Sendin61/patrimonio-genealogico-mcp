@@ -18,6 +18,8 @@ class LabPaths:
     cache: Path
     logs: Path
     config: Path
+    runtime: Path
+    models: Path
 
     def ensure(self) -> "LabPaths":
         for path in (
@@ -28,6 +30,8 @@ class LabPaths:
             self.cache,
             self.logs,
             self.config,
+            self.runtime,
+            self.models,
         ):
             path.mkdir(parents=True, exist_ok=True)
         return self
@@ -55,6 +59,8 @@ def resolve_lab_paths(*, create: bool = False) -> LabPaths:
         cache=root / "cache",
         logs=root / "logs",
         config=root / "config",
+        runtime=root / "runtime",
+        models=root / "models",
     )
     return paths.ensure() if create else paths
 
