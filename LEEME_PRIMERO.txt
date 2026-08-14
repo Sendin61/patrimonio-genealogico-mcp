@@ -1,0 +1,69 @@
+ROB GENEALOGY LAB — ALPHA LOCAL
+=================================
+
+Todo este proyecto debe permanecer en:
+
+C:\Users\Usuario\Downloads\ROB-Genealogy-Lab
+
+PRIMERA VEZ
+-----------
+
+1. IA LOCAL
+   Haz doble clic en:
+
+   INSTALAR_IA_LOCAL.bat
+
+   Descarga dentro de ESTA MISMA CARPETA:
+   - llama.cpp portable para Windows x64 (Vulkan)
+   - Qwen3-4B-Q4_K_M.gguf
+
+   No crea claves ni usa una API de pago.
+
+2. EXTENSION DE CHROME
+   Abre Chrome y entra en:
+
+   chrome://extensions
+
+   Activa "Modo de desarrollador" > "Cargar descomprimida" y selecciona:
+
+   C:\Users\Usuario\Downloads\ROB-Genealogy-Lab\extension
+
+   Abre FamilySearch normalmente e inicia sesion tu mismo.
+
+3. INICIAR ROB
+   Haz doble clic en:
+
+   INICIAR_ROB_GENEALOGY_LAB.bat
+
+   ROB abrirá su interfaz en Chrome:
+
+   http://127.0.0.1:8877
+
+USO NORMAL
+----------
+
+Después de la primera instalación basta con:
+
+- tener una pestaña normal de FamilySearch abierta y con tu sesión;
+- comprobar que la extensión ROB aparece conectada;
+- ejecutar INICIAR_ROB_GENEALOGY_LAB.bat;
+- escribir la investigación como quieras, incluso con faltas o abreviaturas.
+
+Ejemplo:
+
+  buscame los padres d andres quintas barela x arzua creo q sobre 1800. el ocr puede estar fatal. mira varias paginas antes d concluir
+
+REGLAS DE DISEÑO IMPORTANTES
+-----------------------------
+
+- El OCR original nunca se sustituye silenciosamente.
+- Una lectura contextual como Bea -> Varela queda como inferencia con confianza y evidencia.
+- Los candidatos importantes se analizan con contexto de varias páginas.
+- Los datos, caché, modelos y base SQLite se guardan bajo esta carpeta de Descargas.
+- No hay créditos de IA local por consulta.
+- OpenAI no es necesario para el funcionamiento esencial.
+
+ALPHA
+-----
+
+Esta primera versión sirve para validar el recorrido real en tu equipo y, especialmente, que FamilySearch acepte los ARK vecinos DGS generados para recuperar OCR multipágina. Si un endpoint cambia o tu sesión devuelve un formato distinto, ROB conserva el expediente y lo corregiremos sobre evidencia real en vez de forzar automatización del navegador.
