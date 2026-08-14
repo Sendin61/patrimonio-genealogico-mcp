@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from starlette.applications import Starlette
@@ -153,8 +154,19 @@ async def prepare_research(request: Request) -> JSONResponse:
 
 
 async def bridge_next(request: Request) -> JSONResponse:
-    command = bridge.next_command()
-    return JSONResponse({"command": command.to_dict() if command else None})
+    try:
+        wait_seconds = float(request.query_params.get("wait", "0") or 0)
+    except ValueError:
+        wait_seconds = 0.0
+    wait_seconds = max(0.0, min(wait_seconds, 25.0))
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        command = bridge.next_command()
+        if command is not None:
+            return JSONResponse({"command": command.to_dict()})
+        if time.monotonic() >= deadline:
+            return JSONResponse({"command": None})
+        await asyncio.sleep(0.25)
 
 
 async def bridge_result(request: Request) -> JSONResponse:
