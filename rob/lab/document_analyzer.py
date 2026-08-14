@@ -78,7 +78,7 @@ SCHEMA: dict[str, Any] = {
             },
         },
         "needs_more_context": {"type": "boolean"},
-        "more_context_direction": {"type": ["string", "null"], "enum": ["before", "after", "both", null]},
+        "more_context_direction": {"type": ["string", "null"], "enum": ["before", "after", "both", None]},
     },
     "required": [
         "relevance",
