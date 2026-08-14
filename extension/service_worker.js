@@ -14,6 +14,10 @@ function isFamilySearchUrl(value) {
   }
 }
 
+function isImageArk(value) {
+  return /^3:[12]:[A-Z0-9-]+$/i.test(String(value || '').trim());
+}
+
 async function familySearchTabs() {
   const tabs = await chrome.tabs.query({});
   return tabs.filter(tab => isFamilySearchUrl(tab.url || ''));
@@ -136,7 +140,7 @@ async function runCommand(command) {
     result = await pageFetch(tab.id, url);
   } else if (command.type === 'structured_ocr' || command.type === 'ocr_page') {
     const imageId = String(payload.image_id || '').trim();
-    if (!/^3:1:[A-Z0-9-]+$/i.test(imageId)) return {ok: false, error: 'Identificador de imagen OCR no válido.'};
+    if (!isImageArk(imageId)) return {ok: false, error: 'Identificador de imagen OCR no válido.'};
     const requestedHost = String(payload.host || 'https://sg30p0.familysearch.org').replace(/\/$/, '');
     if (!isFamilySearchUrl(requestedHost + '/')) return {ok: false, error: 'Host OCR no válido.'};
     const url = `${requestedHost}/service/records/volunteer/orchestration/sls/image/records/${imageId}`;
@@ -145,17 +149,19 @@ async function runCommand(command) {
     const items = Array.isArray(payload.items) ? payload.items.slice(0, 25) : [];
     if (!items.length) return {ok: false, error: 'No se indicaron páginas OCR.'};
     const pages = [];
-    for (const item of items) {
+    await Promise.all(items.map(async item => {
       const imageId = String(item?.image_id || '').trim();
       const host = String(item?.host || 'https://sg30p0.familysearch.org').replace(/\/$/, '');
-      if (!/^3:1:[A-Z0-9-]+$/i.test(imageId) || !isFamilySearchUrl(host + '/')) {
+      if (!isImageArk(imageId) || !isFamilySearchUrl(host + '/')) {
         pages.push({image_id: imageId, ok: false, error: 'Identificador/host no válido.'});
-        continue;
+        return;
       }
       const url = `${host}/service/records/volunteer/orchestration/sls/image/records/${imageId}`;
       const page = parseMaybeJson(await pageFetch(tab.id, url));
       pages.push({image_id: imageId, ...page});
-    }
+    }));
+    const order = new Map(items.map((item, index) => [String(item?.image_id || '').trim(), index]));
+    pages.sort((a, b) => (order.get(a.image_id) ?? 9999) - (order.get(b.image_id) ?? 9999));
     return {ok: true, payload: {pages}};
   } else if (command.type === 'familysearch_fetch' || command.type === 'image_metadata') {
     const url = String(payload.url || '').trim();
