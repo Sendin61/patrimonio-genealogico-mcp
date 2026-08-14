@@ -71,6 +71,9 @@ class InMemoryBridgeQueue:
     def result(self, command_id: str) -> BridgeResult | None:
         return self._results.get(command_id)
 
+    def pop_result(self, command_id: str) -> BridgeResult | None:
+        return self._results.pop(command_id, None)
+
     @property
     def connected(self) -> bool:
         return bool(
