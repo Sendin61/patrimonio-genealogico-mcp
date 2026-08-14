@@ -2,8 +2,7 @@
 setlocal
 cd /d "%~dp0"
 
-rem The application root is ALWAYS the folder containing this launcher.
-rem This avoids losing the local model when Windows extracts the ZIP inside an outer folder.
+rem ROB always uses the folder containing this launcher as its canonical local root.
 set "ROB_LAB_HOME=%~dp0"
 
 if not exist ".venv\Scripts\python.exe" (
@@ -22,13 +21,17 @@ if not defined ROB_CHROME if exist "%ProgramFiles(x86)%\Google\Chrome\Applicatio
 if not defined ROB_CHROME if exist "%LocalAppData%\Google\Chrome\Application\chrome.exe" set "ROB_CHROME=%LocalAppData%\Google\Chrome\Application\chrome.exe"
 
 if defined ROB_CHROME (
-  start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Milliseconds 1400; Start-Process '%ROB_CHROME%' 'http://127.0.0.1:8877'"
+  start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Milliseconds 1300; Start-Process '%ROB_CHROME%' 'http://127.0.0.1:8877'"
 ) else (
-  start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Milliseconds 1400; Start-Process 'http://127.0.0.1:8877'"
+  start "" powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Milliseconds 1300; Start-Process 'http://127.0.0.1:8877'"
 )
 
-echo [ROB] Iniciando ROB Genealogy Lab en http://127.0.0.1:8877
-".venv\Scripts\python.exe" -m rob.lab.local_app
+echo [ROB] ROB Genealogy Lab activo.
+echo [ROB] Raiz: %ROB_LAB_HOME%
+echo [ROB] Puedes minimizar esta ventana. Para cerrar ROB: Ctrl+C.
+echo.
+
+".venv\Scripts\python.exe" -c "import uvicorn; from rob.lab.local_app import app; uvicorn.run(app, host='127.0.0.1', port=8877, log_level='warning', access_log=False)"
 goto :eof
 
 :error
